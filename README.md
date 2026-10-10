@@ -410,8 +410,26 @@ delivery UUID 先进入 `inflight` 状态，**只有在所有 NATS 发布 + flus
 
 - 转发器**不持有 Gitea token**，用的 NATS 账号也只能发布三个 subject、不能读消息、不能冒充任何 Agent。即使被打穿，影响面仅限于伪造门铃——而门铃里只有公开元数据和 URL，没有正文。
 - webhook 用 HMAC-SHA256 校验；监听端应放在内网 / tailnet，不暴露公网。
-- 密钥在运维方的 env 文件里（`0600`），成员映射是只读挂载。两者都不进镜像、也不进这个仓库。
-- bind mount 的 `/config` 建议只读（`:ro`），口令建议用容器 secret 经环境变量注入而非落在文件里。
+
+### 密钥怎么放：不需要你设任何文件权限
+
+密钥**不放进 bind mount 的 `/config`**，走 [`relay.env`](relay.env.example) + compose 的 `env_file:`：
+
+```
+./config/      →  /config   (:ro)   subject、路径、超时、members.json —— 零密钥
+./relay.env    →  不进容器            NATS_PASSWORD + WEBHOOK_SECRET
+./data/        →  /data              去重状态
+```
+
+Docker 在**宿主机侧**读取 `relay.env` 并注入为环境变量——**这个文件从头到尾不进入容器的文件系统**，没有任何途径能把它 mount 进去。所以：
+
+- ❌ **不需要在 DSM 文件管理器里给任何文件单独设 `0600`**。共享文件夹的 ACL 已经在管「其他 DSM 用户能不能看」这件事，那步可以整个省掉。
+- ✅ 拿走容器 ≠ 拿走密钥——密钥从来没在容器里。
+- ✅ `/config` 是 `:ro`，容器改不了 `members.json`，也就改不了门铃去向。
+
+真正要保护的是**宿主机上那份 `relay.env` 的读权限**（拿到 `WEBHOOK_SECRET` 就能伪造门铃，但门铃里只有公开元数据和 URL）。它的**写**权限由共享文件夹权限兜底。
+
+compose 默认带了 `cap_drop: ALL` 和 `no-new-privileges` —— 这台服务只需要「读请求体 + 出网连 NATS」，不需要任何特权；因为监听的是 8090 高位端口，去掉 `NET_BIND_SERVICE` 也能正常启动。
 
 ## 测试
 
@@ -437,23 +455,41 @@ relay/
   Dockerfile         # 只含代码的镜像；配置在运行时挂载
 config/
   webhook2nats.example.toml   # 配置模板（无环境值，可进库）
+  members.json                # 真实成员映射（被 .gitignore 排除）
+relay.env.example              # 密钥模板（无环境值，可进库）
+docker-compose.yml            # 部署文件（全占位符，可进库）
+data/                         # 去重状态（被 .gitignore 排除）
 ```
 
-部署物（compose、真实配置、真实的 members.json、NATS ACL 片段）包含环境相关值，故意放在运维方的内部仓库，不进这个公开库。**配置模板**不含环境值，所以可以公开。
+**哪些能进库、哪些不能**：带 `.example` 后缀的模板、`docker-compose.yml`、以及代码本身**都不含环境值**，所以可以公开。真实配置（`relay.env`、`config/` 下的 `webhook2nats.toml` 与 `members.json`）、NATS ACL 片段仍留在你的 NAS 上，由 `.gitignore` 排除。
 
 ## 部署
 
+仓库根目录带一份 [`docker-compose.yml`](docker-compose.yml)，全占位符，可直接用：
+
 ```bash
-docker run -d --name webhook2nats \
-  -p 8090:8090 \
-  -v /宿主机/path/config:/config:ro \
-  -v webhook2nats-data:/data \
-  -e WEBHOOK_SECRET \
-  --env-file relay.env \
-  webhook2nats:latest
+# 1) 准备两个被忽略的文件
+cp relay.env.example relay.env          # 填入 NATS 账号 + WEBHOOK_SECRET + NATS_PASSWORD
+#    并在 config/members.json 里填好 登录名 → {host, id} 映射
+#    （TOML 落地后再建 config/webhook2nats.toml，当前代码仍走环境变量）
+
+# 2) 起
+docker compose up -d
+
+# 3) 确认
+curl -s localhost:8090/healthz      # → ok
+docker compose logs -f
 ```
 
-`/config` 只读挂载配置与成员映射，`/data` 可写卷放去重状态。`/healthz` 可直接做容器健康检查。
+挂载关系：
+
+| 宿主机 | 容器内 | 模式 | 内容 |
+|---|---|---|---|
+| `./config` | `/config` | `:ro` | `members.json` + `webhook2nats.toml`，**零密钥** |
+| `./relay.env` | **不进容器** | `env_file:` | `NATS_PASSWORD`、`WEBHOOK_SECRET` |
+| `./data` | `/data` | rw | `seen.json` 去重状态 |
+
+镜像本身不含任何环境值，同一个不可变镜像可以在任何环境跑。
 
 ## 设计取舍
 
@@ -462,3 +498,4 @@ docker run -d --name webhook2nats \
 - **不上 JetStream**：Agent 只需要一声即时门铃；离线期间漏掉的，靠来源平台未读状态这条权威对账来源补。持久化队列会重复存储平台已经存的东西。
 - **只通知、不行动**：不持平台写权限，不能标已读，不能代替 Agent 发言。
 - **配置外置于镜像**：所有环境相关值都挂载/注入，同一个不可变镜像可以在任何环境跑，也才敢公开发布。
+
