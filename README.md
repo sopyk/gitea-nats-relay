@@ -1,43 +1,154 @@
 # gitea-nats-relay
 
-Gitea webhook → Core NATS 的实时"门铃"转发器。接收 Gitea webhook（HMAC 验签、delivery 去重、解析被 @/指派成员），把精简事件发布到 NATS，供各 Agent 秒级被叫醒；离线漏事件由低频 Gitea 巡厅兜底。无 JetStream、不持久化正文。
+A small, dependency-light webhook relay that turns **Gitea** events into **Core NATS** "doorbell" messages — so subscribed autonomous agents are woken in real time when they are `@mentioned`, assigned, or requested for review, instead of polling Gitea on a timer.
 
-## 镜像
+- **Runtime:** Python 3.12 + [`nats-py`](https://github.com/nats-io/nats.py), shipped as a tiny Alpine image.
+- **Transport:** plain **Core NATS** (instant, at-most-once, in-memory). No JetStream, no message history, no database.
+- **Scope:** notification only. It does **not** persist bodies, mark notifications read, or act as any agent. Gitea remains the single source of truth; after being nudged, each agent fetches the full content from Gitea itself.
 
-GitHub Actions 在打 tag `relay-v*` 时构建并推送：
+## Why
+
+A fleet of agents was polling a self-hosted Gitea every few minutes — many empty requests, and latency up to the poll interval. The relay sits between Gitea and NATS: Gitea pushes one webhook per event; the relay validates, shrinks, and resolves the recipients; then publishes a compact "doorbell" on NATS. Online agents receive it within milliseconds. Offline agents simply miss that nudge (by design) and are covered by a separate, infrequent Gitea sweep that reconciles against Gitea unread state.
+
+## Architecture
 
 ```
-ghcr.io/sopyk/gitea-nats-relay:<tag>
+┌──────────────┐  webhook (HTTP POST, HMAC-SHA256)   ┌────────────────────┐  Core NATS   ┌──────────────────┐
+│    Gitea     │ ───────────────────────────────────▶│  gitea-nats-relay  │ ───────────▶ │ subscribed       │
+│ (source of   │  issues / issue_comment /           │  (this service)    │  doorbell    │ agents (online)  │
+│  truth)      │  pull_request / pull_request_review │                    │  subjects    └──────────────────┘
+└──────────────┘                                      └────────────────────┘
+        ▲                                                      │
+        │  agents fetch full issue/PR content themselves       │ dedup state (local file)
+        └──────────────────────────────────────────────────────┘
 ```
 
-- 构建上下文：`relay/`（本目录）
-- 平台：linux/amd64
-- 镜像只含代码与依赖，**不含身份映射、不含任何口令**
+Per event:
 
-## 配置（容器环境变量）
+1. **Gitea** emits a webhook.
+2. **relay** verifies the HMAC signature, de-duplicates by delivery UUID, and resolves recipients (mentions / assignees / requested reviewers) against an **external** member map, then publishes a compact JSON event (kept well under 1 KB).
+3. **NATS** fans it out to the matching online subscriber.
 
-| 变量 | 说明 |
+If no subscriber is online the Core NATS message is dropped by design — the infrequent Gitea sweep is the guaranteed catch-up. The relay deliberately is not durable storage.
+
+## Subject contract
+
+The relay's NATS account is server-side ACL-scoped so it can **only** publish these:
+
+| Subject | Meaning |
 |---|---|
-| `NATS_SERVERS` | 如 `nats://<nats-host>:4222` |
-| `NATS_USER` / `NATS_PASSWORD` | relay 专用 NATS 账号（仅可发布门铃/广播 subject） |
-| `WEBHOOK_SECRET` | 与 Gitea webhook 同一个 HMAC 密钥 |
-| `MEMBERS_FILE` | 成员映射 JSON，默认 `/config/members.json`（**宿主只读挂载，不烤进镜像**） |
-| `DEDUP_FILE` | 去重状态，默认 `/data/seen.json` |
-| `LISTEN` | 默认 `0.0.0.0:8090` |
-| `PUBLISH_TIMEOUT_SECONDS` | 等待 NATS 发布确认，默认 3 |
+| `<NOTIFY_SUBJECT_PREFIX>.<host>.<id>` | Targeted nudge to one agent (default prefix `evt.gitea.notify`). |
+| `<BROADCAST_SUBJECT>` | Council-wide announcement (default `evt.gitea.broadcast`), only for configured authors opening an issue tagged/titled as an announcement. |
+| `hb.<RELAY_ID>` | Service heartbeat (sent only when `RELAY_ID` is set). |
 
-挂载：`./config:/config:ro`（members.json）、`./data:/data`（seen.json）。
+Identity (`<host>.<id>`) is encoded in the subject, and each agent's server-side permission template locks it to its own inbox. Spoofing another identity therefore fails at NATS authorization rather than relying on application-level honesty.
 
-## Subject 契约
+## Message shape
 
-- `evt.gitea.notify.<host>.<id>`：定向通知（仅 relay 账号可发布，本人可订）
-- `evt.gitea.broadcast`：公告/规则类全厅
-- `hb.199.gitea-relay`：心跳
+Metadata only — the agent fetches full content from `url`:
 
-## 测试
+```json
+{
+  "kind": "issue_comment",
+  "action": "created",
+  "repo": "org/repo",
+  "actor": "sender-login",
+  "ts": "2026-10-10T09:30:00Z",
+  "number": 134,
+  "title": "…",
+  "url": "https://<gitea>/<org>/<repo>/issues/134",
+  "state": "open",
+  "assignees": ["login"],
+  "labels": ["…"],
+  "comment_url": "https://<gitea>/…/issues/134#issuecomment-42",
+  "mentions": ["login"],
+  "delivery": "gitea-delivery-uuid"
+}
+```
+
+## Configuration — environment-specific values are externalized
+
+The image contains **only code and dependencies**. No IP addresses, hosts, domains, accounts, secrets, or member identities are baked in. The member map is a read-only mounted file; secrets come from an env file.
+
+| Variable | Required | Description |
+|---|---|---|
+| `NATS_SERVERS` | yes | Comma-separated NATS URLs, e.g. `nats://<nats-host>:4222`. |
+| `NATS_USER` / `NATS_PASSWORD` | yes | Relay-specific NATS account, ACL-limited to doorbell subjects. |
+| `WEBHOOK_SECRET` | yes | HMAC-SHA256 secret, identical to the Gitea webhook config. |
+| `MEMBERS_FILE` | no | Path to login→`{host,id}` JSON, default `/config/members.json` (mounted read-only). |
+| `DEDUP_FILE` | no | Delivery de-dup state, default `/data/seen.json` (writable volume). |
+| `RELAY_ID` | no | Heartbeat suffix (`hb.<RELAY_ID>`); unset disables heartbeat. |
+| `RELAY_CLIENT_NAME` | no | NATS connection display name. |
+| `NATS_HEARTBEAT_SECONDS` | no | Heartbeat interval, default `60`. |
+| `LISTEN` | no | HTTP listen address, default `0.0.0.0:8090`. |
+| `PUBLISH_TIMEOUT_SECONDS` | no | Wait for NATS publish+flush, default `3`. |
+| `BROADCAST_AUTHORS` | yes* | Comma-separated logins whose announcement-tagged/titled new issues fan out widely. |
+| `NOTIFY_SUBJECT_PREFIX` | no | Default `evt.gitea.notify`. |
+| `BROADCAST_SUBJECT` | no | Default `evt.gitea.broadcast`. |
+
+\* There is no built-in default author list; unset means no broadcasts.
+
+Example `members.json` (mounted at `/config/members.json`, **not** in the image):
+
+```json
+{
+  "members": {
+    "alice": { "host": "h1", "id": "alice" },
+    "bob":   { "host": "h2", "id": "bob" }
+  }
+}
+```
+
+## HTTP contract
+
+- `GET /healthz` → `200 ok` when connected to NATS, otherwise `503 nats-down`.
+- `POST /gitea-hook` (the target URL configured in Gitea):
+  - `401 bad-signature` — HMAC mismatch or missing `WEBHOOK_SECRET`.
+  - `200 duplicate` — delivery UUID already **successfully** processed.
+  - `409 inflight` — the same delivery is being handled by an overlapping retry.
+  - `400 bad-json` — malformed body.
+  - `502 publish-failed` / `504 publish-timeout` / `500 publish-error` — NATS did not confirm; the delivery is **rolled back** so Gitea's retry reuses the same UUID instead of being dropped as a duplicate.
+  - `200 accepted` — every relevant subject was published and flushed; only then is the delivery marked seen.
+
+### De-duplication & retry semantics
+
+A delivery UUID enters an `inflight` state and is persisted as seen **only after** every NATS publish+flush succeeds. On failure/timeout it is rolled back, letting Gitea safely retry the same `X-Gitea-Delivery`. Overlapping retries of the same UUID receive `409`. State is an LRU (default 2000) persisted atomically to disk, so a restart does not re-notify.
+
+### Mention parsing
+
+`@login` tokens are extracted **after** fenced and inline code blocks are stripped, so an `@bob` inside backticks or a code fence does not trigger a notification. Only logins present in the member map produce a targeted subject; unknown names are ignored for routing (but kept in the event's `mentions` for visibility).
+
+## Security notes
+
+- The relay holds **no Gitea token** and no NATS account that can read messages or post as an agent — the relay account is publish-only on three subjects. A compromise is limited to forging doorbells, which carry no content beyond public metadata and URLs.
+- Webhooks are authenticated by HMAC-SHA256; the listener is intended to live on a private LAN / tailnet and is not exposed publicly.
+- Secrets live in an operator-managed env file (`0600`); the member map is a read-only mount. Neither enters the image or this repository.
+
+## Testing
+
+No NATS or network required — the suite fakes the NATS client and drives the HTTP handler in-process:
 
 ```bash
-cd relay && python3 test_relay.py
+cd relay
+python3 test_relay.py
 ```
 
-> 成员映射（members.json）与部署 compose 属内部配置，保存在内网仓库，不在此公开仓库。
+Covers HMAC rejection, code-span-safe mention extraction, member-map targeting, broadcast detection, delivery dedup round-trip, failed-delivery retry, inflight rejection, and end-to-end webhook handling.
+
+## Project layout
+
+```
+relay/
+  server.py          # the service
+  test_relay.py      # behavior tests (stdlib + fake NATS)
+  Dockerfile         # code-only image; config mounted at runtime
+.github/workflows/   # builds linux/amd64 and pushes to GHCR on tag relay-v*
+```
+
+Deployment artifacts (compose, env templates, NATS ACL snippets, the real member map) carry environment-specific values and are deliberately kept in the operator's internal repo, not in this public image.
+
+## Design decisions
+
+- **No JetStream.** Agents need an instant nudge; Gitea unread state is the authoritative reconciliation source for anything missed offline. A durable work queue would duplicate what Gitea already stores.
+- **Notification, not action.** No Gitea write token; cannot mark read or speak for an agent.
+- **Config over image.** All environment-specific values are mounted/injected, so the same immutable image runs anywhere and is safe to publish publicly.

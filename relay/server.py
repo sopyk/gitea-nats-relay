@@ -9,21 +9,25 @@ gitea-nats-relay — Gitea webhook -> Core NATS 实时事件 push（阶段2，�
   以 Gitea 未读为唯一对账事实源兜底。
 - 正式留痕仍在 Gitea；NATS 上不保存任何正文历史。
 
-Subject 契约（服务端 ACL 锁定，见 README）：
-- evt.gitea.notify.<host>.<id>   定向通知某个 Agent（仅 relay 可发，本人可订）
-- evt.gitea.broadcast            公告/规则类全厅通知（仅 relay 可发，全员可订）
-- hb.199.gitea-relay             本服务心跳
+Subject 契约（服务端 ACL 锁定，默认前缀，均可用环境变量覆盖）：
+- <NOTIFY_SUBJECT_PREFIX>.<host>.<id>   定向通知（默认 evt.gitea.notify，仅 relay 可发，本人可订）
+- <BROADCAST_SUBJECT>                    公告全厅通知（默认 evt.gitea.broadcast，仅 relay 可发，全员可订）
+- hb.<RELAY_ID>                          本服务心跳（RELAY_ID 由配置提供）
 
-配置（环境变量）：
-  NATS_SERVERS         例 nats://<nats-host>:4222
+配置（环境变量）。所有环境相关值（主机、域名、账号、IP）一律从环境/挂载配置注入，
+代码与镜像中不内置任何具体环境值：
+  NATS_SERVERS         例 nats://<nats-host>:4222（逗号分隔多个）
   NATS_USER / NATS_PASSWORD   gitea-relay 专用账号
+  RELAY_ID             心跳标识后缀，如 <host>.gitea-relay；留空则不发心跳
+  RELAY_CLIENT_NAME    NATS 连接显示名，默认 gitea-nats-relay
   NATS_HEARTBEAT_SECONDS       默认 60
   WEBHOOK_SECRET       Gitea webhook 配置里同一个密钥（HMAC-SHA256）
-  MEMBERS_FILE         登录名 -> {host,id} 映射 JSON，默认 /data/members.json
+  MEMBERS_FILE         登录名 -> {host,id} 映射 JSON，默认 /config/members.json
   DEDUP_FILE           去重持久化文件，默认 /data/seen.json
   LISTEN               默认 0.0.0.0:8090
-  BROADCAST_AUTHORS    逗号分隔，这些作者新建带"公告"标签的 issue 走全厅，
-                       默认 mayaoyao,sopyk
+  BROADCAST_AUTHORS    必填：逗号分隔登录名，这些作者新建带"公告"标签/标题的 issue 走全厅
+  NOTIFY_SUBJECT_PREFIX 默认 evt.gitea.notify
+  BROADCAST_SUBJECT    默认 evt.gitea.broadcast
 """
 import asyncio
 import concurrent.futures
@@ -59,9 +63,13 @@ def log(*a):
 
 
 MEMBERS = {}
+# 公告作者必须显式配置（登录名逗号分隔），代码里不内置任何具体账号。
 BROADCAST_AUTHORS = set(
-    os.environ.get("BROADCAST_AUTHORS", "mayaoyao,sopyk").split(",")
+    x for x in os.environ.get("BROADCAST_AUTHORS", "").split(",") if x.strip()
 )
+# subject 前缀是协议契约，给默认值但允许环境覆盖（多实例/多站点时隔离）。
+NOTIFY_SUBJECT_PREFIX = os.environ.get("NOTIFY_SUBJECT_PREFIX", "evt.gitea.notify")
+BROADCAST_SUBJECT = os.environ.get("BROADCAST_SUBJECT", "evt.gitea.broadcast")
 
 
 def load_members():
@@ -214,7 +222,9 @@ class Relay:
     def __init__(self):
         self.nc = None
         self.loop = None
-        self.relay_id = "199.gitea-relay"
+        # 心跳标识（含主机标识）必须由环境提供，代码里不内置具体主机号/服务名。
+        self.relay_id = os.environ.get("RELAY_ID", "")
+        self.client_name = os.environ.get("RELAY_CLIENT_NAME", "gitea-nats-relay")
 
     async def connect(self):
         servers = os.environ["NATS_SERVERS"]
@@ -224,11 +234,14 @@ class Relay:
             password=os.environ.get("NATS_PASSWORD"),
             connect_timeout=10,
             max_reconnect_attempts=-1,
-            name="gitea-nats-relay",
+            name=self.client_name,
         )
         log("NATS connected:", servers)
         self.loop = asyncio.get_running_loop()
-        asyncio.create_task(self._heartbeat())
+        if self.relay_id:
+            asyncio.create_task(self._heartbeat())
+        else:
+            log("RELAY_ID not set; heartbeat disabled")
 
     async def _heartbeat(self):
         period = int(os.environ.get("NATS_HEARTBEAT_SECONDS", "60"))
@@ -250,9 +263,9 @@ class Relay:
         async def run():
             subjects = []
             if is_broadcast(ev):
-                subjects.append("evt.gitea.broadcast")
+                subjects.append(BROADCAST_SUBJECT)
             for host, aid in extract_targets(ev):
-                subjects.append(f"evt.gitea.notify.{host}.{aid}")
+                subjects.append(f"{NOTIFY_SUBJECT_PREFIX}.{host}.{aid}")
             results = []
             for subject in subjects:
                 try:
