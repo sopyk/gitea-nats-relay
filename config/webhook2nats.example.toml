@@ -1,0 +1,105 @@
+# Webhook2NATS 配置模板
+#
+# 复制成 webhook2nats.toml 后按需修改，再 bind mount 到容器的 /config/。
+#   群晖 / Linux：docker run -v /宿主机/path/config:/config:ro ...
+#   docker compose：volumes: ["./config:/config:ro"]
+#
+# 本文件里所有值都是占位符，不含任何真实环境值，可以安全地进版本库。
+# 真实配置（含口令、成员映射）请留在宿主机，不要提交。
+#
+# 优先级：环境变量 > 本文件 > 代码默认值。
+#        环境变量优先是为了兼容容器 secret 与 CI 注入。
+#
+# 格式选择 TOML 的原因：Python 3.11+ 标准库自带 tomllib，零新增依赖；
+# 重复键会直接报错而不是静默取最后一个；缩进不敏感，NAS 上手改不会被
+# 粘贴进来的 Tab 坑到。（YAML 需要额外装 PyYAML，且 password: 123456
+# 会被隐式解析成整数。）
+
+# ── 服务自身 ────────────────────────────────────────────────
+[service]
+# HTTP 监听地址
+listen = "0.0.0.0:8090"
+
+# NATS 连接显示名，便于在 nats-server 的连接列表里认出自己
+client_name = "webhook2nats"
+
+# 心跳标识后缀，最终发布的 subject 是 hb.<relay_id>。
+# 留空则不发心跳。
+relay_id = "<host>.webhook2nats"
+
+# 心跳间隔（秒）
+heartbeat_seconds = 60
+
+# 等待 NATS 发布确认（flush）的超时（秒）。
+# 该值会直接传给 nats.py 的 flush(timeout=...)，不是 HTTP 层的事务超时。
+publish_timeout_seconds = 3
+
+# ── NATS 连接 ──────────────────────────────────────────────
+[nats]
+# 多个地址逗号或数组分隔均可
+servers = ["nats://<nats-host>:4222"]
+
+# 转发器专用账号，服务端 ACL 已限权到门铃 subject
+user = "<nats-user>"
+password = "<nats-password>"
+
+# ── 路由 / 收件人解析 ──────────────────────────────────────
+[routing]
+# 登录名 → {host, id} 映射 JSON，只读挂载
+members_file = "/config/members.json"
+
+# 定向通知 subject 前缀，最终 subject 为 <prefix>.<host>.<id>
+notify_subject_prefix = "evt.gitea.notify"
+
+# 全厅公告 subject
+broadcast_subject = "evt.gitea.broadcast"
+
+# 允许走全厅公告的作者登录名。留空 = 不发任何公告。
+# 代码里没有内置任何默认作者。
+broadcast_authors = ["<login>", "<login>"]
+
+# ── 去重状态 ──────────────────────────────────────────────
+[dedup]
+# 可写卷。LRU 容量，条目超过后淘汰最旧的。
+file = "/data/seen.json"
+capacity = 2000
+
+# ── Provider：接入一个 Webhook 平台 ────────────────────────
+#
+# 通用通道的核心：接入一个新平台 = 声明 5 件事。
+#   1. 路由路径       path
+#   2. 事件类型头     headers.event
+#   3. 投递 ID 头     headers.delivery
+#   4. 验签算法与位置  signature.*
+#   5. 事件名 → 统一事件类型的映射   events
+#
+# 注意：第 5 项只能声明平台已经发出的 header 值。以 Gitea 为例，
+# 评审类事件的 X-Gitea-Event 是 pull_request_approved /
+# pull_request_rejected / pull_request_comment 三个不同的值，
+# 并不存在 "pull_request_review" 这个 header 值 —— 后者只是
+# Gitea 建 webhook 时用的分组配置键。照抄会静默丢掉全部评审事件。
+
+[providers.gitea]
+enabled = true
+path = "/gitea-hook"
+
+[providers.gitea.headers]
+event = "X-Gitea-Event"
+delivery = "X-Gitea-Delivery"
+signature = "X-Gitea-Signature"
+
+[providers.gitea.signature]
+# hmac-sha256 | hmac-sha1 | hmac-sha512
+algorithm = "hmac-sha256"
+
+# HMAC 密钥。也可用环境变量 WEBHOOK_SECRET 注入（容器 secret 的推荐方式），
+# 环境变量优先于本文件。
+secret = "<与 Gitea webhook 配置里同一个密钥>"
+
+[providers.gitea.events]
+issues = "issue"
+issue_comment = "issue_comment"
+pull_request = "pull_request"
+pull_request_approved = "review"
+pull_request_rejected = "review"
+pull_request_comment = "review"
