@@ -67,24 +67,40 @@ capacity = 2000
 # ── Provider：接入一个 Webhook 平台 ────────────────────────
 #
 # 通用通道的核心：接入一个新平台 = 声明 5 件事。
-#   1. 路由路径       path
-#   2. 事件类型头     headers.event
-#   3. 投递 ID 头     headers.delivery
-#   4. 验签算法与位置  signature.*
-#   5. 事件名 → 统一事件类型的映射   events
+#   1. 路由路径         path
+#   2. 事件类型头       headers.event      粗：归一化组名
+#   3. 精确触发头       headers.event_type 细：可选，部分平台只有一个头
+#   4. 投递 ID 头       headers.delivery
+#   5. 验签算法与位置    signature.*
+#   6. 事件名 → 统一事件类型的映射   events / event_types
 #
-# 注意：第 5 项只能声明平台已经发出的 header 值。以 Gitea 为例，
-# 评审类事件的 X-Gitea-Event 是 pull_request_approved /
-# pull_request_rejected / pull_request_comment 三个不同的值，
-# 并不存在 "pull_request_review" 这个 header 值 —— 后者只是
-# Gitea 建 webhook 时用的分组配置键。照抄会静默丢掉全部评审事件。
+# 为什么需要「粗 + 细」两个事件头：
+# 有些平台会把多个触发器折叠成同一个组名。以 Gitea 为例，「请求评审」
+# (pull_request_review_request)、「推 commit」(pull_request_sync)、
+# 「新开 PR」(pull_request) 三者在 X-Gitea-Event 里**都是 pull_request**，
+# 只有 X-Gitea-Event-Type 才区分得开。不读细头就做不到「请求评审」路由。
+#
+# 只有 GitHub 这类「单个头本身就精确」的平台才把 headers.event_type 留空 ——
+# 此时下面整张 [providers.gitea.event_types] 不生效，退化为单表匹配。
+#
+# ⚠️ 两个坑：
+# 1. 表名/键名写错**不会报错**（TOML 只校验语法不校验 schema），配置会静默失效。
+#    未知键将在启动时被校验并拒绝。详见 README「配置校验的风险」。
+# 2. Gitea 的事件名只写平台**实际发出的 header 值**，不要照抄文档里的分类名。
+#    评审类事件在 X-Gitea-Event 里是 pull_request_approved /
+#    pull_request_rejected / pull_request_comment 三个独立值，
+#    并不存在 "pull_request_review" 这个 header 值 —— 后者只是 Gitea
+#    建 webhook 时用的分组配置键，从不投递。照抄会静默丢掉全部评审事件。
 
 [providers.gitea]
 enabled = true
 path = "/gitea-hook"
 
 [providers.gitea.headers]
+# 粗头：归一化组名（push / issues / pull_request / issue_comment …）
 event = "X-Gitea-Event"
+# 细头：精确触发器。**可选** —— 只有粗头的平台整行删掉即可。
+event_type = "X-Gitea-Event-Type"
 delivery = "X-Gitea-Delivery"
 signature = "X-Gitea-Signature"
 
@@ -96,6 +112,7 @@ algorithm = "hmac-sha256"
 # 环境变量优先于本文件。
 secret = "<与 Gitea webhook 配置里同一个密钥>"
 
+# 粗头映射表。**兼底** —— 先查下面那张 event_types，未命中才查这里。
 [providers.gitea.events]
 issues = "issue"
 issue_comment = "issue_comment"
@@ -103,3 +120,11 @@ pull_request = "pull_request"
 pull_request_approved = "review"
 pull_request_rejected = "review"
 pull_request_comment = "review"
+
+# 细头映射表。**优先于上面的 events**。
+# 只写「与 [events] 结果不同」的条目；未列出的精确触发器自动回落到 [events]。
+# 完整对照见 README「Gitea 的两个事件头」。
+[providers.gitea.event_types]
+# 「请求评审」必须单列：它在粗头里是 pull_request，与「新开 PR」「推 commit」
+# 完全无法区分。不单列就做不到 README 承诺的「请求评审」路由。
+pull_request_review_request = "review"

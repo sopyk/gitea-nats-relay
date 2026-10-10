@@ -14,25 +14,27 @@ Gitea / Forgejo 是**第一个接入方**，本文档以它作为完整示例；
 
 ## 实现状态
 
-本文档描述的是**目标设计**。dev 分支正在向它推进，下表是当前的真实进度。
-
 | 能力 | 状态 |
 |---|---|
-| HMAC-SHA256 验签、定长比较 | ✅ 可用 |
+| HMAC-SHA1/256/512 验签、定长比较 | ✅ 可用 |
 | delivery 去重：inflight 占位 / 失败回滚 / LRU 原子落盘 | ✅ 可用 |
-| @提及解析（先剥离代码块与行内码） | ✅ 可用 ⚠️ 见下方说明 |
-| 成员映射路由、公告判定 | ✅ 可用 |
-| Core NATS 发布 + flush 确认 | ✅ 可用 |
-| `GET /healthz`、服务心跳、SIGTERM 优雅退出 | ✅ 可用 |
-| **配置文件（TOML）加载 + 环境变量覆盖** | 🚧 dev 进行中 |
-| **provider 抽象（事件头 / delivery 头 / 验签 / 事件映射可配）** | 🚧 dev 进行中 |
-| **`/config` 只读 bind mount 约定** | 🚧 dev 进行中 |
+| **缺 delivery 头时拒绝**（`400 missing-delivery`） | ✅ 可用 |
+| **@提及解析：中文紧邻字符也能匹配**，邮箱/路径不误触 | ✅ 可用 |
+| **provider 抽象**：头名 / 验签 / 路由路径 / 事件映射全部来自配置 | ✅ 可用 |
+| **双事件头**：`X-Gitea-Event` + `X-Gitea-Event-Type`，细头表优先 | ✅ 可用 |
+| **评审事件**：`pull_request_approved` / `_rejected` / `_comment` 不再丢失 | ✅ 可用 |
+| **评审正文的 @提及**（读 `review.content`） | ✅ 可用 |
+| **请求评审路由**（读顶层 `requested_reviewer` 单数字段） | ✅ 可用 |
+| **`ts` 兜底**，不再恒为空串 | ✅ 可用 |
+| **成员映射逐条校验**，坏数据不再全员 500 | ✅ 可用 |
+| **请求体上限** + Content-Length 防护 | ✅ 可用 |
+| **`flush(timeout=…)`**，不再 504 之后仍投递 | ✅ 可用 |
+| **TOML 配置加载 + 环境变量覆盖** | ✅ 可用 |
+| **启动配置校验**：未知键 / 非法 kind / 两表冲突告警 | ✅ 可用 |
+| `/healthz`、服务心跳、SIGTERM 优雅退出 | ✅ 可用 |
+| 更多 provider（GitHub / GitLab） | ⏳ 下一平台 |
 
-标 🚧 的部分描述的是设计，代码尚未落地；以代码现状为准。进度与已知缺陷在 dev 分支的 PR 里跟踪。
-
-> ⚠️ **`@提及` 解析目前只在 `@登录名` 前后是空格或 ASCII 标点时生效。**
-> 中文正文里常见的「请@某人看」这种紧邻写法会被漏掉。这条正在 dev 上修，
-> 见「@提及解析」一节。
+进度与已知缺陷在 dev 分支的 PR 里跟踪。`relay/test_internals.py` 用**照着 Gitea 源码结构体造的 payload** 覆盖了上述每一项，`relay/test_relay.py` 走真实 socket 做端到端验证。
 
 ---
 
@@ -127,7 +129,7 @@ alice 那边收到的就是这一条：
   "action": "created",
   "repo": "org/repo",
   "actor": "you",
-  "ts": "",
+  "ts": "2026-10-10T09:30:00Z",
   "number": 134,
   "title": "评审流水线的重试策略",
   "url": "https://gitea.example/org/repo/issues/134",
@@ -142,7 +144,8 @@ alice 那边收到的就是这一条：
 
 **注意里面没有「这个重试上限你看要不要设成 3」这句话。** relay 刻意不搬运正文——门铃只负责说一声「134 号 issue 上有个跟你有关的动静」，正文由 alice 自己回 Gitea 拉。这是它能被摆在打穿影响面里的前提：即使伪造门铃，里面也只有公开元数据和 URL。
 
-> 🚧 `ts` 目前恒为空——Gitea 的 webhook payload 里压根没有时间字段（代码读的是一个不存在的 `action_at`）。正在补回退逻辑。
+> `ts` 是接收时刻的 ISO-8601 时间戳。Gitea 的 webhook payload 里**没有**时间字段，
+> 所以这里取的是 relay 收到请求的时刻 —— 够 Agent 排序和判断新鲜度，不代表事件在平台上的真实发生时间。
 
 ### 09:30:00.015 — alice 醒来
 
@@ -219,21 +222,38 @@ curl -i -X POST http://127.0.0.1:8090/gitea-hook \
 
 其余全部是平台无关的通用能力：HTTP 接收、delivery 幂等去重、按成员映射路由、发布到 NATS 并等待确认。
 
-接入一个新平台（GitHub / GitLab / Jenkins / …）= 声明五件事：
+接入一个新平台（GitHub / GitLab / Jenkins / …）= 声明六件事：
 
 | # | provider 要声明 | 说明 |
 |---|---|---|
 | 1 | 路由路径 | Webhook 回调打在本服务的哪个 URL 上 |
-| 2 | 事件类型头 | 事件类型写在哪个头字段 |
-| 3 | delivery 头 | 投递唯一 ID 在哪个头字段 |
-| 4 | 验签算法 | 该平台用什么算法、签名放在哪个头 |
-| 5 | 事件映射 | 平台的原始事件名 → 统一事件类型；payload 归一化成统一字段 |
+| 2 | 粗事件头 | 归一化组名写在哪个头字段 |
+| 3 | 细事件头 | 精确触发器写在哪个头字段（**可选**，见下） |
+| 4 | delivery 头 | 投递唯一 ID 在哪个头字段 |
+| 5 | 验签算法 | 该平台用什么算法、签名放在哪个头 |
+| 6 | 事件映射 | 平台的原始事件名 → 统一事件类型；payload 归一化成统一字段 |
 
-**前四件是声明式的，直接写配置；第五件的后半段（payload 归一化）是需要写代码的**，因为每个平台的 JSON 结构都不一样。归一化之后进入核心逻辑的部分完全一致。
+**前五件是声明式的，直接写配置；第六件的后半段（payload 归一化）是需要写代码的**，因为每个平台的 JSON 结构都不一样。归一化之后进入核心逻辑的部分完全一致。
+
+#### 为什么事件头要分粗细两个
+
+有些平台会把多个触发器**折叠成同一个组名**。以 Gitea 为例，下面三件事在 `X-Gitea-Event` 里**全都是 `pull_request`**，只有 `X-Gitea-Event-Type` 才区分得开：
+
+| 实际发生的事 | `X-Gitea-Event`（粗） | `X-Gitea-Event-Type`（细） |
+|---|---|---|
+| 张三开了这个 PR | `pull_request` | `pull_request` |
+| 李四被**指派为评审人** | `pull_request` | `pull_request_review_request` |
+| 王五往这个 PR **推了新 commit** | `pull_request` | `pull_request_sync` |
+
+这直接决定「该通知谁」——指派评审该通知李四，推 commit 该通知 assignee。只读粗头就分不开，README 承诺的**「请求评审」路由就做不到**。
+
+粗头的存在是有理由的（Gitea 配置界面里订阅「Pull Request」是一栏勾选，勾上后所有子触发器都跟着来），细头是用来还原细节的。
+
+**细头槽位是可选的。** GitHub 只有一个 `X-GitHub-Event`，而且它本身就是精确的（`pull_request_review` 和 `pull_request_review_comment` 是分开的），压根不需要粗细之分。这类平台把 `headers.event_type` 整行删掉即可，`[providers.X.event_types]` 随之不生效，自动退化成单表匹配——**通用接口不该被 Gitea 的形状绑死**。
 
 ### 以 Gitea 为例
 
-Gitea 走 JSON Webhook，验签用 `X-Gitea-Signature` 放 HMAC-SHA256 十六进制串，delivery ID 在 `X-Gitea-Delivery`，事件类型在 `X-Gitea-Event`。对应配置见 [`config/webhook2nats.example.toml`](config/webhook2nats.example.toml)：
+Gitea 走 JSON Webhook，验签用 `X-Gitea-Signature` 放 HMAC-SHA256 十六进制串，delivery ID 在 `X-Gitea-Delivery`。完整配置见 [`config/webhook2nats.example.toml`](config/webhook2nats.example.toml)：
 
 ```toml
 [providers.gitea]
@@ -242,6 +262,7 @@ path = "/gitea-hook"
 
 [providers.gitea.headers]
 event = "X-Gitea-Event"
+event_type = "X-Gitea-Event-Type"
 delivery = "X-Gitea-Delivery"
 signature = "X-Gitea-Signature"
 
@@ -256,18 +277,54 @@ pull_request = "pull_request"
 pull_request_approved = "review"
 pull_request_rejected = "review"
 pull_request_comment = "review"
+
+[providers.gitea.event_types]
+pull_request_review_request = "review"
 ```
 
-> **写事件映射时有个坑，务必照着平台实际发出的 header 值写。**
-> Gitea 发送的是 `X-Gitea-Event: <EventType.Event()>`，而评审类事件实际发出的是
-> `pull_request_approved` / `pull_request_rejected` / `pull_request_comment`
-> 三个不同的值——**并不存在 `pull_request_review` 这个 header 值**，
-> 后者只是 Gitea 建 webhook 时用的分组配置键。照抄分组键会静默丢掉全部评审事件
-> （服务返回 `200 ignored:...`，平台会认为投递成功且永不重试）。
->
-> 通用教训：**事件映射要对着平台发出的实际 header 取值来写，不要照着平台的文档分类名写。**
+匹配顺序：**先查 `[event_types]`（细头），未命中再查 `[events]`（粗头），都没命中才 `200 ignored:`**。所以 `[event_types]` 里只写「与 `[events]` 结果不同」的条目就行。
 
-Gitea 的 payload 归一化（第五件的后半段）就是把 `repository` / `sender` / `issue` / `pull_request` / `comment` / `review` 这些平台特有字段，收敛成下面那份统一事件。
+#### Gitea 的完整事件头对照表
+
+这张表是配事件映射的依据。以下对照 Gitea `main` 分支的 `modules/webhook/type.go` 与 `services/webhook/deliver.go` 推导：
+
+| `X-Gitea-Event-Type`（精确触发器） | → | `X-Gitea-Event`（组名） | 只靠粗头能区分吗 |
+|---|---|---|---|
+| `pull_request_review_approved` | → | `pull_request_approved` | ✅ 粗头已独立 |
+| `pull_request_review_rejected` | → | `pull_request_rejected` | ✅ 粗头已独立 |
+| `pull_request_review_comment` | → | `pull_request_comment` | ✅ 粗头已独立 |
+| `pull_request_review_request` | → | `pull_request` | ❌ **必须读细头** |
+| `pull_request_sync` | → | `pull_request` | ❌ 必须读细头 |
+| `pull_request_assign` / `_label` / `_milestone` | → | `pull_request` | ❌ 必须读细头 |
+| `issue_assign` / `issue_label` / `issue_milestone` | → | `issues` | ❌ 必须读细头 |
+| `pull_request_comment` | → | `issue_comment` | ❌ 必须读细头 |
+| `push` `create` `delete` `fork` `wiki` `repository` `release` `package` `status` `workflow_run` `workflow_job` | → | 同名 | ✅ 粗头已独立 |
+
+> ⚠️ **两个会导致静默丢事件的坑**
+>
+> **1. 别照抄文档里的分类名。** Gitea 从不投递 header 值 `pull_request_review`——那只是配置界面的分组伞事件名。上表里评审三事件在粗头中各自独立，所以 `[events]` 里那三行是对的，**不要因为「粗头是组名」就以为它们会折叠而删掉**。
+>
+> **2. `pull_request_comment` 在两个头里含义不同。** 同一个字符串：
+> - 出现在 `X-Gitea-Event` 里 → 来自 `pull_request_review_comment`，即**评审意见**，应映射成 `review`
+> - 出现在 `X-Gitea-Event-Type` 里 → 来自 `pull_request_comment`，即 **PR 主对话区的评论**，应映射成 `issue_comment`
+>
+> **每张表匹配哪个头必须写清楚**，否则以后把映射切到细头上就会悄悄改错。
+
+### 配置校验的风险
+
+两张表的设计有几条已知风险，都靠**启动时的配置校验**兜底（已实现）：
+
+| 风险 | 后果 | 缓解 |
+|---|---|---|
+| 两张表同一键值不同 | 改 `[events]` 忘了改 `[event_types]`，**改动静默不生效** | 启动时打 WARN，点名哪个实际生效 |
+| **表名写错** | TOML 只校验语法不校验 schema，`[event_type]`（少个 s）会被当成无关新表，**细粒度路由全丢**且无报错 | 启动时校验未知键并拒绝启动 |
+| `kind` 值不校验语义 | 填进组名而非事件类型，下游收到永不出现的 `kind` | 启动时对白名单校验 |
+| 配置文件不完整 | 只写 `[nats]` 不写 providers，事件映射悄悄变空 | 拒绝启动，不静默退回默认 |
+| 接口被 Gitea 形状污染 | 只有单头的平台被迫配一张永远空的表 | `event_type` / `event_types` 均可选 |
+
+最后一条同样是「`members.json` 无 schema 校验」的同类问题，已一并解决：成员映射现在逐条校验，一个非 dict 值会让**整个文件**被拒绝并打印是哪个登录名有问题，而不是让每一次 webhook 抛异常。
+
+Gitea 的 payload 归一化（第六件的后半段）就是把 `repository` / `sender` / `issue` / `pull_request` / `comment` / `review` 这些平台特有字段，收敛成下面那份统一事件。
 
 目前内置的是 `gitea`。这套接口是稳定的——这是本服务设计成通用转发器的关键。
 
@@ -277,9 +334,9 @@ Gitea 的 payload 归一化（第五件的后半段）就是把 `repository` / `
 
 镜像里**只有代码和依赖**，不含任何 IP、主机、域名、账号、口令，也不含成员身份。成员映射是只读挂载的文件，密钥走环境变量文件。
 
-### 🚧 配置文件形态（dev 进行中）
+### 配置文件形态
 
-配置以**一个 TOML 文件**为准，通过 **bind mount** 进容器；环境变量作为覆盖手段保留。
+配置以**一个 TOML 文件**为准，通过 **bind mount** 进容器；环境变量作为覆盖手段保留（兼容尚未迁移的部署，也承担容器 secret 的角色）。
 
 ```
 /config/                ← 只读 bind mount（宿主目录 → 容器）
@@ -374,11 +431,14 @@ Gitea 的 payload 归一化（第五件的后半段）就是把 `repository` / `
 | kind | 触发事件 |
 |---|---|
 | `issue` | issue 新建 / 重开 / 关闭 / 指派 / 标签变更… |
-| `issue_comment` | issue 或 PR 下的评论 |
+| `issue_comment` | issue 或 PR 下的评论（含 PR 主对话区） |
 | `pull_request` | PR 新建 / 同步 / 关闭… |
-| `review` | 评审通过 / 驳回 / 评审意见 |
+| `review` | 评审通过 / 驳回 / 评审意见 / **请求评审** |
 
 按事件类型还会多带这些可选字段：`is_pr`（是否为 PR）、`comment_url`、`mentions`、`review_state`、`reviewers`。
+
+> **`ts` 是接收时刻**，不是事件在平台上的发生时间 —— Gitea 的 webhook payload
+> 里没有时间字段。上面示例里的 `"2026-10-10T09:30:00Z"` 就是真实会出现的格式。
 
 ## HTTP 契约
 
@@ -401,10 +461,16 @@ delivery UUID 先进入 `inflight` 状态，**只有在所有 NATS 发布 + flus
 
 抽取 `@登录名` 时**先剥离代码块和行内代码**——所以反引号或代码块里的 `@bob` 不会触发通知。只有出现在成员映射里的登录名才会生成定向 subject；不在映射里的名字不路由，但会保留在事件的 `mentions` 里供展示。
 
-> ⚠️ 🚧 边界判定正在重写。当前实现要求 `@登录名` 前后是空格或 ASCII 标点，
-> 中文正文里「请@某人看」「@某人，请跟进」这类紧邻写法会漏掉。
-> 目标行为：`@` 前后为空白、ASCII 标点、CJK 字符或全角标点时都视为有效边界，
-> 但仍要排除邮箱地址（`user@example.com`）和路径。
+边界的判定用**显式的 ASCII 字符类**，不用 `\b` / `\w`：Python 3 的 `\w` 是 Unicode 感知的，汉字属于 `\w`，于是「请@bob看」「@bob请看」会被误判成「`@` 紧邻单词字符」而丢掉——而中文正文里那才是常态。
+
+| 写法 | 结果 | 说明 |
+|---|---|---|
+| `请 @bob 看` | ✅ | 空格边界 |
+| `请@bob看` | ✅ | 汉字边界 |
+| `@bob，请跟进` | ✅ | 全角标点边界 |
+| `` `@bob` 是代码 `` | ❌ 不触发 | 行内码被剥离 |
+| `user@example.com` | ❌ 不触发 | 邮箱 |
+| `src/@file` | ❌ 不触发 | 路径 |
 
 ## 安全说明
 
@@ -433,39 +499,60 @@ compose 默认带了 `cap_drop: ALL` 和 `no-new-privileges` —— 这台服务
 
 ## 测试
 
-不需要真实的 NATS 或网络——测试里用假的 NATS 客户端、直接调 HTTP handler：
+三套测试，都不需要真实 NATS 或外网：
 
 ```bash
+python3 test_deploy.py            # 部署产物：README↔配置模板↔compose 是否漂移
 cd relay
-python3 test_relay.py
+python3 test_internals.py         # 配置加载/校验、provider、归一化、@提及、去重、路由
+python3 test_relay.py             # HTTP 端到端：真 socket、真 HMAC，只有 NATS 是假的
 ```
 
-覆盖：HMAC 拒绝、代码块内 @ 不误触、成员映射路由、公告判定、delivery 去重往返、失败重试、inflight 拒绝、端到端 webhook 处理。
+**`relay/fixtures.py` 里的 payload 严格对照 Gitea `modules/structs/hook.go` 的结构体造**，不是凭印象编的 —— 正是那几个结构体里藏着本项目踩过的坑（payload 没有 `action_at`、`ReviewPayload` 用 `content` 而非 `body`、`requested_reviewer` 是顶层单数字段）。
 
-> 🚧 上面的覆盖清单是**目标**。当前测试通过替换掉 NATS 客户端来跑，
-> 成员映射路由的 subject 拼接、provider 事件映射、payload 归一化这几段
-> 尚未被直接覆盖。dev 分支会补上以真实平台 payload 为 fixture 的用例。
+覆盖：HMAC 拒绝与篡改检测、代码块/邮箱/路径不误触、中文紧邻字符 @提及、成员映射路由与坏数据拒绝、公告判定、delivery 去重往返与重启保持、缺 delivery 头拒绝、失败回滚后同 UUID 可重试、inflight 冲突、双事件头映射与优先级、评审三事件、请求评审与推 commit 的区分、body 上限与 Content-Length 防护、端到端 webhook 处理。
+
+`test_deploy.py` 专门盯**文档与产物漂移** —— README 里的 provider 示例与 `config/webhook2nats.example.toml` 不一致、两份 compose 除了镜像来源之外不一致、README 链接指向不存在的文件，这些都会被它挡住。
 
 ## 目录结构
 
 ```
 relay/
-  server.py          # 服务主体
-  test_relay.py      # 行为测试（标准库 + 假 NATS）
-  Dockerfile         # 只含代码的镜像；配置在运行时挂载
+  app.py            # 装配：加载配置 → 建注册表 → 连 NATS → 起 HTTP
+  config.py         # 配置加载（env > TOML > 默认）+ 启动校验 + 成员映射校验
+  providers.py      # provider 注册表 + @提及抽取 + Gitea payload 归一化
+  core.py           # 去重 / 收件人解析 / 公告判定（与平台无关）
+  server.py         # HTTP 接收层（不认识任何具体平台）
+  fixtures.py       # 真实 Gitea payload fixture
+  test_internals.py # 单元测试
+  test_relay.py     # HTTP 端到端测试
+  Dockerfile
 config/
   webhook2nats.example.toml   # 配置模板（无环境值，可进库）
   members.json                # 真实成员映射（被 .gitignore 排除）
 relay.env.example              # 密钥模板（无环境值，可进库）
-docker-compose.yml            # 部署文件（全占位符，可进库）
+docker-compose.yml            # 用预构建镜像
+docker-compose.build.yml      # 从源码构建
+test_deploy.py                # 部署产物一致性测试
 data/                         # 去重状态（被 .gitignore 排除）
 ```
 
-**哪些能进库、哪些不能**：带 `.example` 后缀的模板、`docker-compose.yml`、以及代码本身**都不含环境值**，所以可以公开。真实配置（`relay.env`、`config/` 下的 `webhook2nats.toml` 与 `members.json`）、NATS ACL 片段仍留在你的 NAS 上，由 `.gitignore` 排除。
+**哪些能进库、哪些不能**：带 `.example` 后缀的模板、两份 compose、测试 fixture、以及代码本身**都不含环境值**，所以可以公开。真实配置（`relay.env`、`config/` 下的 `webhook2nats.toml` 与 `members.json`）、NATS ACL 片段仍留在你的 NAS 上，由 `.gitignore` 排除。
 
 ## 部署
 
-仓库根目录带一份 [`docker-compose.yml`](docker-compose.yml)，全占位符，可直接用：
+仓库根目录有**两份** compose，按你从哪拿镜像来选：
+
+| 文件 | 镜像来源 | 用法 |
+|---|---|---|
+| [`docker-compose.yml`](docker-compose.yml) | 拉取预构建镜像（GHCR） | `docker compose up -d` |
+| [`docker-compose.build.yml`](docker-compose.build.yml) | 从 `./relay` 本地构建 | `docker compose -f docker-compose.build.yml up -d --build` |
+
+> 做成两份**独立完整文件**而不是 Compose 的 `-f a.yml -f b.yml` 覆盖写法，是因为
+> 群晖 Container Manager 一次只认一个 compose 文件。代价是两份有重复，
+> 改动时必须同步——`test_deploy.py` 里有一条用例专门盯着这个。
+
+NAS 离线、或还没配 CI 镜像时用 `docker-compose.build.yml`；有 registry 之后用默认那份。
 
 ```bash
 # 1) 准备两个被忽略的文件
@@ -474,14 +561,14 @@ cp relay.env.example relay.env          # 填入 NATS 账号 + WEBHOOK_SECRET + 
 #    （TOML 落地后再建 config/webhook2nats.toml，当前代码仍走环境变量）
 
 # 2) 起
-docker compose up -d
+docker compose up -d          # 或 docker compose -f docker-compose.build.yml up -d --build
 
 # 3) 确认
 curl -s localhost:8090/healthz      # → ok
 docker compose logs -f
 ```
 
-挂载关系：
+挂载关系（两份一致）：
 
 | 宿主机 | 容器内 | 模式 | 内容 |
 |---|---|---|---|
@@ -491,9 +578,30 @@ docker compose logs -f
 
 镜像本身不含任何环境值，同一个不可变镜像可以在任何环境跑。
 
+### 镜像 tag 的选择与风险
+
+默认用的是 `:latest`。四种写法的取舍：
+
+| 写法 | 优点 | 风险 |
+|---|---|---|
+| `:latest`（默认） | 永远拿最新，不用想版本 | **是移动指针**——同一个名字不保证是同一个镜像。NAS 自动更新、重启重建、或将来加了 `pull_policy: always` 时，可能悄悄换成没测过的版本 |
+| `:1.0` 小版本 | 可复现、可回滚 | 忘了同步 tag 就会一直用旧版 |
+| `:<git-sha>` | 最精确，能追到具体 commit | 不好记，镜像列表会很长 |
+| `none` + 手动 `docker tag` | 完全自控 | 每次升级都多一步手工操作 |
+
+**当前这套的风险偏低**：默认的 `docker-compose.yml` 用的是 `image:` 而非 `build:`，
+`docker compose up` 不会去拉远端（除非镜像本地不存在或你显式 `pull`）；而
+`docker-compose.build.yml` 每次都在本地重新构建，tag 固定为 `webhook2nats:local`，
+不存在移动指针。
+
+**真正需要警惕的是将来这两件事**：一是给 compose 加了 `pull_policy: always`；
+二是群晖 Container Manager 里配了「自动更新镜像」。任一条成立，`:latest` 就会
+开始自动漂移。届时建议改成钉小版本。
+
 ## 设计取舍
 
-- **平台适配做成声明式配置，而不是运行时插件**：前四件事（路径、三个头名、验签算法）各平台差异很小且稳定，写死在代码里每次接新平台都要改代码；声明式配置把它变成一次 diff。payload 归一化确实各平台不同，那部分保留为代码，不硬套进配置。
+- **出站 schema 固定，入站适配可配**：那份统一事件 JSON 是**出站契约，定下来就不动**——已经有多个 Agent 在订阅，动一次所有下游都得跟着改，属于破坏性变更。所以 `kind` 保持在四个取值，宁可往里塞也不往外加。入站那头（头名、验签算法、事件映射）各平台差异大且相对稳定，尽量配置化：接新平台应该只是一次 diff，而不是一次发版。
+- **平台适配做成声明式配置，而不是运行时插件**：路径、头名、验签算法这些各平台差异很小，写死在代码里每次接新平台都要改代码；声明式配置把它变成改配置。payload 归一化确实各平台结构不同，那部分保留为代码，不硬套进配置。
 - **TOML 而不是 .env / YAML**：零新增依赖、重复键报错、口令不会被隐式转型、对 Tab 不敏感——后者对 NAS 上手工编辑配置很关键。
 - **不上 JetStream**：Agent 只需要一声即时门铃；离线期间漏掉的，靠来源平台未读状态这条权威对账来源补。持久化队列会重复存储平台已经存的东西。
 - **只通知、不行动**：不持平台写权限，不能标已读，不能代替 Agent 发言。

@@ -1,30 +1,32 @@
-# Webhook2NATS — Docker Compose 部署文件
+# Webhook2NATS — 使用预构建镜像
 #
 # 本文件不含任何环境值，可以安全地进版本库。真实值放在两个被忽略的文件里：
 #   ./relay.env        密钥（NATS_PASSWORD / WEBHOOK_SECRET），由本仓库 .gitignore 排除
 #   ./config/          身份映射与配置，其中只有 members.json 需要你自己填
 #
-# 首次部署：
-#   cp relay.env.example relay.env      # 填入密钥
-#   cp config/webhook2nats.example.toml config/webhook2nats.toml
-#   # 在 config/members.json 填入 登录名 → {host, id} 映射
+# 用法：
+#   docker compose pull          # 拉取镜像
 #   docker compose up -d
+#   curl -s localhost:8090/healthz      # → ok
 #
-# ── 关于密钥安全 ─────────────────────────────────────────────
-# relay.env 由 Docker 在**宿主机侧**读取并注入为环境变量，
-# 它不会、也无法被 mount 进容器的文件系统。所以：
-#   * 不需要在 DSM 文件管理器里给任何文件单独设 600 权限
-#     （共享文件夹的 ACL 已经在管「其他 DSM 用户能不能看」这件事）
-#   * 容器里也读不到这个文件，拿走容器不等于拿走密钥
-#   * ./config 是 :ro 挂载，容器改不了 members.json，也就改不了门铃去向
+# 想从源码构建，请改用 docker-compose.build.yml。
+# 两份文件请保持同步，差异仅限镜像来源。
 #
-# 真正的信任边界是 WEBHOOK_SECRET：拿到它就能伪造门铃。
-# 但门铃里只有公开元数据和 URL，没有正文 —— 这是设计上的取舍，见 README「安全说明」。
+# ── 镜像 tag 怎么选 ─────────────────────────────────────────
+# 默认用 :latest —— 它是一个会移动的指针，**同一个名字不保证是同一个镜像**。
+# 本仓库目前没有 CI 在推镜像，GHCR 上可能还没有对应 tag，此时需要先
+# docker compose build 或等 CI 发布，否则 pull 会失败。
+#
+# 自托管生产环境通常更推荐钉死小版本：
+#   image: ghcr.io/sopyk/webhook2nats:1.0
+# 原因见 README「镜像 tag 的选择与风险」。
 
 services:
   webhook2nats:
-    build: ./relay
-    image: webhook2nats:latest
+    # 主推 GitHub Container Registry；如同时推到 Docker Hub 可换成：
+    #   image: sopyk/webhook2nats:latest
+    image: ghcr.io/sopyk/webhook2nats:latest
+
     container_name: webhook2nats
     restart: unless-stopped
 
@@ -37,7 +39,8 @@ services:
       # 去重状态：需要可写。与配置目录物理分开，便于备份/重建。
       - ./data:/data
 
-    # 密钥走这里，不走 volumes —— Docker 在宿主侧读取后注入为环境变量。
+    # 密钥走这里，不走 volumes —— Docker 在宿主侧读取后注入为环境变量，
+    # 该文件不会进入容器的文件系统。详见 README「安全说明」。
     env_file:
       - ./relay.env
 
@@ -45,7 +48,6 @@ services:
       LISTEN: "0.0.0.0:8090"
       MEMBERS_FILE: "/config/members.json"
       DEDUP_FILE: "/data/seen.json"
-      # 不写 .pyc，避免污染只读根文件系统（配合下面的 read_only）
       PYTHONDONTWRITEBYTECODE: "1"
       TZ: "Asia/Shanghai"
 
@@ -55,18 +57,15 @@ services:
         max-size: "10m"
         max-file: "3"
 
-    # ── 加固项 ──────────────────────────────────────────────
     # 这台服务只需要「读 body + 出网连 NATS」，不需要任何特权。
-    # cap_drop: ALL 会移除全部 capability；因为监听 8090 是高位端口，
-    # 不需要 NET_BIND_SERVICE，所以这样能正常启动。
+    # 监听 8090 是高位端口，去掉 NET_BIND_SERVICE 也能正常启动。
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
 
-    # 只读根文件系统：这个服务除了 /data 没有任何理由写盘。
-    # 解开下面这段可以让它更硬，但要注意 nats-py / Python 运行期
-    # 可能仍需要写 /tmp（已用 tmpfs 兜住）。
+    # 更硬的选项（默认关闭）：除了 /data 没有任何理由写盘。
+    # 配合上面的 PYTHONDONTWRITEBYTECODE 可避免写 .pyc 失败。
     # read_only: true
     # tmpfs:
     #   - /tmp
