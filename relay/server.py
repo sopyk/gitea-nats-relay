@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gitea-nats-relay — Gitea webhook -> Core NATS 实时事件 push（阶段2，无 JetStream）
+Webhook2NATS — Webhook -> Core NATS 实时事件转发（阶段2，无 JetStream）
 
 职责边界：
 - 只做"门铃"：收 Gitea webhook，校验 HMAC，去重，解析被点名/指派成员，
@@ -224,7 +224,7 @@ class Relay:
         self.loop = None
         # 心跳标识（含主机标识）必须由环境提供，代码里不内置具体主机号/服务名。
         self.relay_id = os.environ.get("RELAY_ID", "")
-        self.client_name = os.environ.get("RELAY_CLIENT_NAME", "gitea-nats-relay")
+        self.client_name = os.environ.get("RELAY_CLIENT_NAME", "webhook2nats")
 
     async def connect(self):
         servers = os.environ["NATS_SERVERS"]
@@ -298,7 +298,7 @@ EVENT_MAP = {
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "gitea-nats-relay/1.0"
+    server_version = "webhook2nats/1.0"
 
     def _reply(self, code, msg="ok"):
         self.send_response(code)
