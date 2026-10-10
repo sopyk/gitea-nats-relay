@@ -3,3 +3,5 @@ relay.env
 config/
 data/
 seen.json
+__pycache__/
+*.pyc

@@ -16,18 +16,21 @@ Subject 契约（服务端 ACL 锁定，默认前缀，均可用环境变量覆�
 
 配置（环境变量）。所有环境相关值（主机、域名、账号、IP）一律从环境/挂载配置注入，
 代码与镜像中不内置任何具体环境值：
-  NATS_SERVERS         例 nats://<nats-host>:4222（逗号分隔多个）
-  NATS_USER / NATS_PASSWORD   gitea-relay 专用账号
-  RELAY_ID             心跳标识后缀，如 <host>.gitea-relay；留空则不发心跳
-  RELAY_CLIENT_NAME    NATS 连接显示名，默认 webhook2nats
-  NATS_HEARTBEAT_SECONDS       默认 60
-  WEBHOOK_SECRET       Gitea webhook 配置里同一个密钥（HMAC-SHA256）
-  MEMBERS_FILE         登录名 -> {host,id} 映射 JSON，默认 /config/members.json
-  DEDUP_FILE           去重持久化文件，默认 /data/seen.json
-  LISTEN               默认 0.0.0.0:8090
-  BROADCAST_AUTHORS    必填：逗号分隔登录名，这些作者新建带"公告"标签/标题的 issue 走全厅
-  NOTIFY_SUBJECT_PREFIX 默认 evt.gitea.notify
-  BROADCAST_SUBJECT    默认 evt.gitea.broadcast
+  NATS_SERVERS              例 nats://<nats-host>:4222（逗号分隔多个）【必填】
+  NATS_USER / NATS_PASSWORD gitea-relay 专用账号【必填】
+  WEBHOOK_SECRET            Gitea webhook 配置里同一个密钥（HMAC-SHA256）【必填】
+  RELAY_ID                  心跳标识后缀，如 <host>.gitea-relay；留空则不发心跳
+  RELAY_CLIENT_NAME         NATS 连接显示名，默认 webhook2nats
+  NATS_HEARTBEAT_SECONDS    心跳间隔，默认 60
+  MEMBERS_FILE              登录名 -> {host,id} 映射 JSON，默认 /config/members.json
+  DEDUP_FILE                去重持久化文件，默认 /data/seen.json
+  LISTEN                    HTTP 监听地址，默认 0.0.0.0:8090
+  PUBLISH_TIMEOUT_SECONDS   等待 NATS 发布确认超时，默认 3
+  BROADCAST_AUTHORS         逗号分隔登录名，这些作者新建带"公告"标签/标题的 issue 走全厅【必填*】
+  NOTIFY_SUBJECT_PREFIX     默认 evt.gitea.notify
+  BROADCAST_SUBJECT         默认 evt.gitea.broadcast
+
+* 代码里没有内置任何默认作者；不配等于不发全厅公告。
 """
 import asyncio
 import concurrent.futures
@@ -36,6 +39,7 @@ import hmac
 import json
 import os
 import re
+import signal
 import sys
 import threading
 from collections import OrderedDict
@@ -149,13 +153,6 @@ class Seen:
 SEEN = None  # type: ignore
 
 
-def base_url(payload):
-    repo = (payload.get("repository") or {})
-    raw = repo.get("html_url") or ""
-    # html_url 形如 http://host:port/songsir-group/AgentCouncil
-    return raw.rsplit("/", 2)[0] if raw.count("/") >= 2 else ""
-
-
 def compact(payload, kind, action):
     """压成 ≤~1KB 的门铃：足够判断相关性，正文让 agent 拿 API 拉。"""
     repo = payload.get("repository") or {}
@@ -199,7 +196,6 @@ def extract_targets(ev):
     logins.update(ev.get("assignees") or [])
     logins.update(ev.get("mentions") or [])
     logins.update(ev.get("reviewers") or [])
-    # 被请求评审（Gitea 放在 pull_request requested_reviewers 已在 assignees? 兜底从原始无需）
     targets = []
     for lg in logins:
         m = MEMBERS.get(lg)
@@ -225,6 +221,7 @@ class Relay:
         # 心跳标识（含主机标识）必须由环境提供，代码里不内置具体主机号/服务名。
         self.relay_id = os.environ.get("RELAY_ID", "")
         self.client_name = os.environ.get("RELAY_CLIENT_NAME", "webhook2nats")
+        self._shutdown = False
 
     async def connect(self):
         servers = os.environ["NATS_SERVERS"]
@@ -245,7 +242,7 @@ class Relay:
 
     async def _heartbeat(self):
         period = int(os.environ.get("NATS_HEARTBEAT_SECONDS", "60"))
-        while True:
+        while not self._shutdown:
             try:
                 await self.nc.publish(f"hb.{self.relay_id}",
                                       f"hb|{self.relay_id}|online".encode())
@@ -277,6 +274,9 @@ class Relay:
             return results
         future = asyncio.run_coroutine_threadsafe(run(), self.loop)
         return future
+
+    def shutdown(self):
+        self._shutdown = True
 
 
 RELAY = Relay()
@@ -366,8 +366,19 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(200, "accepted")
 
 
+def validate_env():
+    required = ["NATS_SERVERS", "NATS_USER", "NATS_PASSWORD", "WEBHOOK_SECRET"]
+    missing = [v for v in required if not os.environ.get(v)]
+    if missing:
+        log("ERROR: missing required env vars:", ", ".join(missing))
+        sys.exit(1)
+    if not os.environ.get("BROADCAST_AUTHORS"):
+        log("WARN: BROADCAST_AUTHORS not set; broadcast disabled")
+
+
 async def amain():
     global SEEN
+    validate_env()
     os.makedirs(os.path.dirname(os.environ.get("DEDUP_FILE", "/data/seen.json")),
                 exist_ok=True)
     SEEN = Seen(os.environ.get("DEDUP_FILE", "/data/seen.json"))
@@ -377,7 +388,22 @@ async def amain():
     host, port = listen.split(":")
     httpd = ThreadingHTTPServer((host, int(port)), Handler)
     log("listening on", listen)
+
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        log("shutdown signal received")
+        RELAY.shutdown()
+        httpd.shutdown()
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _signal_handler)
+
     await asyncio.get_running_loop().run_in_executor(None, httpd.serve_forever)
+    await stop_event.wait()
+    log("server stopped")
 
 
 if __name__ == "__main__":
