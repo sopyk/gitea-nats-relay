@@ -55,14 +55,22 @@ class Provider:
         secret = self.cfg.signature.secret
         if not secret:
             return False
-        provided = headers.get(self.cfg.signature_header, "")
+        provided = (headers.get(self.cfg.signature_header) or "").strip()
         if not provided:
             return False
+        # HTTP 头按 latin-1 解码，所以任何 >= 0x80 的字节都会让签名头变成非 ASCII
+        # 字符串，而 compare_digest 对非 ASCII str 直接抛 TypeError。
+        # 一个未认证客户端就能靠发一个乱码签名头把连接打断。
+        if not provided.isascii():
+            return False
+        digest = self.cfg.signature.hash_name
+        if digest is None:  # 理论上 validate() 已拦掉，这里是防御
+            return False
         expected = hmac.new(
-            secret.encode(), body, getattr(hashlib, self.cfg.signature.hash_name)
+            secret.encode(), body, getattr(hashlib, digest)
         ).hexdigest()
         # 定长比较：非定长的 == 会被时序侧信道逐字节爆破
-        return hmac.compare_digest(expected, provided.strip())
+        return hmac.compare_digest(expected, provided)
 
     def read_delivery(self, headers):
         return headers.get(self.cfg.delivery_header, "")
@@ -83,7 +91,23 @@ def _now_iso():
 
 
 def _login_list(users):
-    return [u.get("login") for u in (users or []) if isinstance(u, dict) and u.get("login")]
+    if not isinstance(users, list):
+        return []
+    return [u.get("login") for u in users if isinstance(u, dict) and u.get("login")]
+
+
+def _obj(value):
+    """只把 dict 当对象用。
+
+    `or {}` 挡不住非空字符串/数字：payload 里的字段是平台给的，
+    上游改结构或中间有代理改写 body，就会变成 'str' object has no attribute
+    'get'。对已验签的请求来说这是静默的、永久的丢事件。
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _user_login(value):
+    return _obj(value).get("login")
 
 
 def normalize_gitea(payload, kind, action):
@@ -95,27 +119,27 @@ def normalize_gitea(payload, kind, action):
       * `requested_reviewer`（单数）是 review_request 动作专用的，
         和 PR 上的 `requested_reviewers`（复数）不是一回事
     """
-    repo = payload.get("repository") or {}
-    sender = payload.get("sender") or {}
+    repo = _obj(payload.get("repository"))
+    sender = _obj(payload.get("sender"))
 
     # Gitea 的 issue_comment 事件把 PR 放在**顶层** pull_request，
     # 而 issue 对象上那个 pull_request 只是个 URL 摘要。两者都看一眼。
-    issue_obj = payload.get("issue") if isinstance(payload.get("issue"), dict) else {}
-    is_pr = bool(payload.get("pull_request")) or bool(issue_obj.get("pull_request"))
-    obj = issue_obj or payload.get("pull_request") or {}
+    issue_obj = _obj(payload.get("issue"))
+    is_pr = bool(_obj(payload.get("pull_request"))) or bool(issue_obj.get("pull_request"))
+    obj = issue_obj or _obj(payload.get("pull_request"))
 
     # review_request 动作时，被请求的那个人在顶层单数字段里。
     # 不把它算进收件人，「请求评审」就通知不到人。
     reviewers = list(_login_list(obj.get("requested_reviewers")))
-    reviewer = (payload.get("requested_reviewer") or {}).get("login")
+    reviewer = _user_login(payload.get("requested_reviewer"))
     if reviewer and reviewer not in reviewers:
         reviewers.append(reviewer)
 
     ev = {
         "kind": kind,
         "action": action,
-        "repo": repo.get("full_name", ""),
-        "actor": sender.get("login", ""),
+        "repo": repo.get("full_name") or "",
+        "actor": sender.get("login") or "",
         # Gitea 的 webhook payload 里根本没有时间字段（旧代码读一个不存在的
         # action_at，永远拿到空串）。这里退回到本地时钟 —— 至少让下游能排序。
         "ts": payload.get("action_at") or _now_iso(),
@@ -132,15 +156,15 @@ def normalize_gitea(payload, kind, action):
         ev["labels"] = [l.get("name") for l in (obj.get("labels") or [])
                         if isinstance(l, dict) and l.get("name")]
 
-    c = payload.get("comment") or {}
+    c = _obj(payload.get("comment"))
     if c:
-        ev["comment_url"] = c.get("html_url", "")
+        ev["comment_url"] = c.get("html_url") or ""
         # Gitea 的 Comment 结构体**没有** mentions 字段（API 里有，webhook 里没有），
         # 所以提及只能靠正文正则抽。留着一行兼容将来可能的字段。
         api = _login_list(c.get("mentions"))
         ev["mentions"] = sorted(set(api) | set(extract_mentions(c.get("body") or "")))
 
-    rev = payload.get("review") or {}
+    rev = _obj(payload.get("review"))
     if rev:
         # Gitea 的 ReviewPayload 是 {"type": ..., "content": ...}，
         # 读 body 会永远拿到 None，评审正文里的 @提及 100% 丢失。

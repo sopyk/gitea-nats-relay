@@ -7,7 +7,9 @@ README 说 A、示例 TOML 写 B、server.py 读 C，���且没有任何报
 
 运行：python3 test_deploy.py
 """
-import json
+import ast
+import glob
+import importlib.util
 import os
 import re
 import subprocess
@@ -16,7 +18,6 @@ import tomllib
 import unittest
 
 try:
-    import importlib.util
     HAS_YAML = importlib.util.find_spec("yaml") is not None
 except Exception:  # noqa
     HAS_YAML = False
@@ -56,6 +57,122 @@ def strip_comments(text):
         if line.strip():
             out.append(line.rstrip())
     return "\n".join(out)
+
+
+def _env_vars_read_in_code():
+    """扫出 relay/ 下所有非测试模块读取的环境变量。
+
+    走 _scan_actual，这样局部别名（`s = env.get(k,"")`）也认得。
+    """
+    found = set()
+    for path in glob.glob(os.path.join(ROOT, "relay", "*.py")):
+        name = os.path.basename(path)
+        if name.startswith("test_") or name in ("fixtures.py", "__init__.py"):
+            continue
+        with open(path, encoding="utf-8") as f:
+            found |= _scan_actual(f.read())
+    return found
+
+
+def _discover_env_wrappers():
+    """找出 relay/*.py 里「内部会读环境变量」的包装函数名。
+
+    判据：函数体里有 os.environ / environ 的读取，且不返回任何 TOML 配置字段。
+    这样 `_apply_env` 里的 `def s(k): return env.get(k,"")` 会被自动认出来，
+    不必在测试里硬编码函数名 —— 改了 config.py 的写法也不用回来改测试。
+    """
+    names = set()
+    for path in glob.glob(os.path.join(ROOT, "relay", "*.py")):
+        base = os.path.basename(path)
+        if base.startswith("test_") or base == "fixtures.py":
+            continue
+        with open(path, encoding="utf-8") as f:
+            try:
+                tree = ast.parse(f.read())
+            except SyntaxError:
+                continue
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for call in ast.walk(fn):
+                if not (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "get"):
+                    continue
+                recv = call.func.value
+                is_env = (isinstance(recv, ast.Attribute) and recv.attr == "environ") or \
+                         (isinstance(recv, ast.Name) and recv.id in ENV_LOOKUP_ALIASES)
+                if is_env and call.args and isinstance(call.args[0], ast.Name):
+                    names.add(fn.name)
+                    break
+    return frozenset(names)
+
+
+def _scan_actual(src):
+    """扫出某段代码里读**环境变量**的字面量（AST，不靠正则猜）。
+
+    正则版本踩过三次坑：只认 `env.get(` 扫不到局部别名；只认宽松模式会把
+    `_apply_env` 的定义行本身算进去；跨行的 `def s(k):\n return env.get(k)`
+    又匹配不上。
+
+    AST 解决了前两个，但直接把「实参是字符串字面量的 .get()」全认下来，又会
+    把 `raw.get("servers")` 这类读 TOML 的调用算进来。所以按接收者过滤：
+    `os.environ.get` 无歧义；局部包装函数约定用 `k`/`key` 作形参
+    （config.py 里的 `def s(k): return env.get(k, "")` 就是这种），
+    而读配置字典的接收者是 `raw` / `data` 这类名字，不在白名单里。
+    """
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return set()
+
+    found = set()
+    for node in ast.walk(tree):
+        # os.environ["X"] —— 只认明确挂在 environ 上的下标，
+        # 免得把 rt["broadcast_authors"] 这种读 TOML 的下标也算进来。
+        if (isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "environ"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)):
+            found.add(node.slice.value)
+            continue
+
+        if not (isinstance(node, ast.Call) and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            continue
+
+        func = node.func
+        # 形式一：X.get("VAR") —— os.environ.get / 局部包装函数 s(...)
+        if isinstance(func, ast.Attribute) and func.attr == "get":
+            recv = func.value
+            if isinstance(recv, ast.Attribute) and recv.attr == "environ":
+                found.add(node.args[0].value)
+            elif isinstance(recv, ast.Name) and recv.id in ENV_LOOKUP_ALIASES:
+                found.add(node.args[0].value)
+            continue
+
+        # 形式二：s("VAR") —— config.py 的 _apply_env 里
+        #     `def s(k): return env.get(k, "")` 那层包装，调用点是裸函数名。
+        #     形参是 k/env/environ 的包装函数才认，否则会把任何业务函数算进来。
+        if isinstance(func, ast.Name) and func.id in ENV_WRAPPER_FUNCS:
+            found.add(node.args[0].value)
+
+    return found
+
+
+# 读环境变量用的局部包装函数/别名白名单。刻意收窄 ——
+# 放宽到「任意标识符.get(字符串)」会把读 TOML 字段的调用一起扫进来。
+ENV_LOOKUP_ALIASES = frozenset({"k", "key", "name", "env", "environ"})
+
+# 形参走 env/k 的环境变量包装函数（如 config.py 里的 `def s(k): return env.get(k,"")`）。
+ENV_WRAPPER_FUNCS = _discover_env_wrappers()
+
+
+def _reply_bodies(src):
+    """server.py 里 _reply(status, "body") 的 body 文案集合。"""
+    return set(re.findall(r'_reply\(\d+,\s*"([\w-]+)"', src))
 
 
 def parse_toml_sections(text):
@@ -295,15 +412,98 @@ class EnvExampleTest(unittest.TestCase):
     """relay.env.example 必须覆盖 server.py 真正读取的全部变量。"""
 
     def test_covers_every_var_server_reads(self):
-        src = open(SERVER, encoding="utf-8").read()
-        code_vars = set(re.findall(r'os\.environ(?:\.get)?\(\s*"(\w+)"', src))
-        code_vars |= set(re.findall(r'os\.environ\[\s*"(\w+)"\s*\]', src))
-        text = strip_comments(open(ENV_EXAMPLE, encoding="utf-8").read())
-        documented = {l.split("=", 1)[0].strip() for l in text.splitlines() if "=" in l}
+        """relay.env.example 必须覆盖代码真正读取的全部变量。
 
-        missing = code_vars - documented
+        注意扫的是 relay/ 下全部非测试模块 —— 重构把 os.environ 全搬进了
+        config.py，这一条护栏曾经因为只扫 server.py 而永远通过。
+        """
+        code_vars = _env_vars_read_in_code()
+        self.assertTrue(code_vars, "没扫到任何环境变量读取，扫描逻辑坏了")
+        # 注意不能 strip_comments：relay.env.example 里的可选项是**注释掉的示例**
+        # （`# RELAY_ID=...`），那正是它们的文档化形式；剥掉就等于要求全部启用。
+        # 这里只要文件里出现过 "VAR=" 就算已记录。
+        with open(ENV_EXAMPLE, encoding="utf-8") as f:
+            raw = f.read()
+        documented = {l.lstrip("# ").split("=", 1)[0].strip()
+                      for l in raw.splitlines() if "=" in l}
+
+        # 这几个由 compose 的 environment: 提供，值是容器内路径、没有环境相关性，
+        # 放进 env 文件反而会让运维以为可以在那里改成宿主路径。
+        provided_elsewhere = {"MEMBERS_FILE", "DEDUP_FILE", "LISTEN"}
+
+        missing = code_vars - documented - provided_elsewhere
         self.assertEqual(missing, set(),
                          f"relay.env.example 未覆盖: {sorted(missing)}")
+
+        # 反过来：凡在 env 文件里出现的，必须真的是代码读到的变量，
+        # 否则模板里会攒下已经废弃的变量名。
+        stale = documented - code_vars - {
+            "允许走全厅公告的作者登录名，逗号分隔。留空"}
+        self.assertEqual(stale, set(),
+                         f"relay.env.example 里有代码不再读取的变量: {sorted(stale)}")
+
+    def test_scan_actually_finds_the_env_reads(self):
+        """反向自检：确保上面两条不是又一个空转的断言。
+
+        写这条是因为前两版扫描分别用了 `env.get(` 和 `os.environ.get(`，而代码里
+        是 `_apply_env(cfg, env)` + `env.get(` —— 两次都一条没扫到，断言永远是假的。
+        """
+        src = open(os.path.join(ROOT, "relay", "config.py"), encoding="utf-8").read()
+        found = _scan_actual(src)
+        self.assertIn("WEBHOOK_SECRET", found, "没扫到 WEBHOOK_SECRET，模式写错了？")
+        self.assertIn("NATS_SERVERS", found, "没扫到 NATS_SERVERS，模式写错了？")
+        self.assertIn("CONFIG_FILE", found)
+        self.assertGreaterEqual(len(found), 10, f"只扫到 {len(found)} 个: {found}")
+
+    def test_config_file_var_is_documented(self):
+        """CONFIG_FILE 是新增的变量，README 与 relay.env.example 都该提到。"""
+        readme = open(README, encoding="utf-8").read()
+        env_ex = open(ENV_EXAMPLE, encoding="utf-8").read()
+        self.assertIn("CONFIG_FILE", readme, "README 未文档化 CONFIG_FILE")
+        self.assertIn("CONFIG_FILE", env_ex, "relay.env.example 未提及 CONFIG_FILE")
+
+    def test_http_status_codes_match_implementation(self):
+        """README 的 HTTP 契约表必须覆盖 server.py 实际返回的每一个状态码。
+
+        手写状态码列表必然漂移 —— 之前就漏了 5 个（404 / 400 bad-length /
+        413 / 400 missing-delivery / 200 ignored），而没有任何东西会发现。
+        """
+        with open(os.path.join(ROOT, "relay", "server.py"), encoding="utf-8") as f:
+            src = f.read()
+        implemented = {int(c) for c, _ in re.findall(r'_reply\((\d+),\s*"([\w-]+)"', src)}
+
+        with open(README, encoding="utf-8") as f:
+            rd = f.read()
+        contract = rd[rd.index("## HTTP 契约"):rd.index("### 去重与重试语义")]
+        documented = {int(c) for c in re.findall(r'`(\d{3})', contract)}
+
+        self.assertTrue(documented, "契约表里一个状态码都没解析到")
+        missing = implemented - documented
+        self.assertEqual(missing, set(),
+                         f"server.py 返回了但 README 契约表没写: {sorted(missing)}")
+
+    def test_every_reply_has_a_documented_body(self):
+        """契约表里的每个 body 文案也要对得上，否则平台侧排查会摸不着头脑。"""
+        with open(os.path.join(ROOT, "relay", "server.py"), encoding="utf-8") as f:
+            src = f.read()
+        bodies = _reply_bodies(src)
+        self.assertIn("accepted", bodies, "没抓到响应体，扫描逻辑坏了")
+
+        with open(README, encoding="utf-8") as f:
+            rd = f.read()
+        contract = rd[rd.index("## HTTP 契约"):rd.index("### 去重与重试语义")]
+        for body in bodies:
+            self.assertIn(f"`{body}`", contract, f"响应体 {body!r} 未写进契约表")
+
+    def test_no_stale_toml_is_coming_claims(self):
+        """README 宣称 TOML 已落地，散落各处的「尚未落地」就是自相矛盾。"""
+        readme = open(README, encoding="utf-8").read()
+        for stale in ("尚未落地", "TOML 落地后", "当前代码仍走环境变量",
+                      "代码尚未落地"):
+            self.assertNotIn(stale, readme,
+                             f"README 仍写着「{stale}」，但实现状态表标了已可用")
+        env_ex = open(ENV_EXAMPLE, encoding="utf-8").read()
+        self.assertNotIn("尚未落地", env_ex)
 
     def test_required_vars_are_uncommented(self):
         """必填项必须是生效的（未注释的）赋值，注释掉等于启动即退出。"""

@@ -81,6 +81,7 @@ class FakeRelay:
         self.targets = []            # [(host, id)]，由用例设置
         self.fail_subjects = set()
         self.hang = False
+        self.cancelled = 0
 
     def submit_event(self, ev):
         relay = self
@@ -95,6 +96,10 @@ class FakeRelay:
                     relay.published.append((subj, ev))
                     out.append((subj, subj not in relay.fail_subjects))
                 return out
+
+            def cancel(inner):
+                relay.cancelled += 1
+                return True
 
         return Future()
 
@@ -309,6 +314,8 @@ class WebhookBehaviorTest(HttpTestBase):
         status, body = self.post(p, delivery="t1")
         self.assertEqual(status, 504)
         self.assertEqual(body, b"publish-timeout")
+        self.assertGreaterEqual(self.relay.cancelled, 1,
+                                "超时应尝试 cancel，避免协程继续跑完")
         self.relay.hang = False
         self.assertEqual(self.post(p, delivery="t1"), (200, b"accepted"))
 
@@ -333,6 +340,84 @@ class WebhookBehaviorTest(HttpTestBase):
         app = self.httpd.RequestHandlerClass.app
         fresh = core.Seen(app.seen.path, app.seen.cap)
         self.assertEqual(fresh.begin("persist"), "seen")
+
+    # ── 回归用例：下面每一条都对应一个真实踩过的坑 ──────────────
+
+    def test_malformed_payload_does_not_leak_inflight(self):
+        """归一化抛异常时占位必须被释放。
+
+        否则同一个 delivery 会被永久卡在 inflight，平台每次重试都只拿到
+        一个误导性的 409 inflight，直到进程重启 —— 通知永久丢失。
+        """
+        app = self.httpd.RequestHandlerClass.app
+        broken = {"repository": "not-a-dict", "sender": {"login": "you"},
+                  "issue": {"number": 1}}
+        status, _ = self.post(broken, event="issues", delivery="LEAK")
+        # _obj 守卫挡住了崩溃，所以这里是正常的 200 —— 但无论如何都不能留下 inflight
+        self.assertIn(status, (200, 500))
+        self.assertNotIn("LEAK", app.seen.inflight, "inflight 占位泄漏了")
+        # 重投要么被正常处理（reserved）、要么已被处理（seen），
+        # 唯一不可接受的是永远 inflight。
+        self.assertIn(app.seen.begin("LEAK"), ("reserved", "seen"))
+
+    def test_unexpected_error_returns_500_not_reset(self):
+        """未预期异常必须变成诚实的 500，而不是连接被重置（客户端零响应）。"""
+        app = self.httpd.RequestHandlerClass.app
+        boom = lambda ev: (_ for _ in ()).throw(RuntimeError("boom"))
+        app.registry["/gitea-hook"].normalizer = boom
+        try:
+            status, body = self.post(fixtures.issue_comment(), delivery="BOOM")
+            self.assertEqual(status, 500)
+            self.assertEqual(body, b"publish-error")
+            self.assertNotIn("BOOM", app.seen.inflight)
+        finally:
+            app.registry["/gitea-hook"].normalizer = providers_mod.normalize_gitea
+
+    def test_non_dict_fields_do_not_crash_normalization(self):
+        """平台改了 payload 结构不能变成永久丢事件。"""
+        app = self.httpd.RequestHandlerClass.app
+        self.relay.targets = [("h1", "mayaoyao")]
+        for i, payload in enumerate([
+            {"repository": "str", "sender": "str", "issue": "str"},
+            {"repository": ["list"], "sender": 42, "issue": {"assignees": "not-a-list"}},
+            {"comment": "str", "issue": {"labels": "not-a-list"}},
+            {"pull_request": 7, "requested_reviewer": "str"},
+            {"review": "str", "issue": {"labels": [None, "x", {"name": "ok"}]}},
+        ]):
+            with self.subTest(i=i):
+                st, _ = self.post(payload, event="issue_comment", delivery=f"m{i}")
+                self.assertIn(st, (200, 500))
+                self.assertEqual(app.seen.begin(f"m{i}"), "seen" if st == 200 else "reserved")
+
+    def test_non_ascii_signature_rejected_cleanly(self):
+        """HTTP 头按 latin-1 解码，>=0x80 的字节让 compare_digest 抛 TypeError。
+
+        旧实现里这会让异常逃出去：客户端连接被重置（零响应），
+        而且每个这样的请求都会往 stderr 打一条 traceback。
+        直接发含 0xE4 的原始字节，绕过 BaseHTTPRequestHandler 的规范化。
+        """
+        body = b'{"issue":{"number":1}}'
+        head = (f"POST /gitea-hook HTTP/1.1\r\nHost: x\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"X-Gitea-Delivery: na\r\n"
+                f"X-Gitea-Event: issues\r\n"
+                f"X-Gitea-Signature: \xe4\xe4\r\n\r\n").encode("latin-1")
+        status, resp = self._http(head + body)
+        self.assertEqual(status, 401, "非 ASCII 签名头应被干净地拒绝为 401")
+        self.assertEqual(resp, b"bad-signature")
+
+    def test_verify_rejects_non_ascii_directly(self):
+        import providers as P
+        cfg = config_mod.load(path="/nonexistent", env={
+            "NATS_SERVERS": "nats://h:4222", "NATS_USER": "u",
+            "NATS_PASSWORD": "p", "WEBHOOK_SECRET": "sec"})
+        prov = P.build_registry(cfg)["/gitea-hook"]
+        self.assertFalse(prov.verify(b"{}", {"X-Gitea-Signature": "ä"}))
+
+    def test_bad_json_never_sticks_in_inflight(self):
+        app = self.httpd.RequestHandlerClass.app
+        self.assertEqual(self.post(None, raw_body=b"{bad")[0], 400)
+        self.assertEqual(app.seen.begin("bj"), "reserved")
 
 
 class HealthTest(HttpTestBase):

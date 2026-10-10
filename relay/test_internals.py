@@ -15,6 +15,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.modules.setdefault("nats", types.ModuleType("nats"))
 
+import json
+
 import config as config_mod
 import core
 import fixtures
@@ -495,6 +497,93 @@ class SeenTest(unittest.TestCase):
         with open(self.path, "w", encoding="utf-8") as f:
             f.write("{broken")
         self.assertEqual(core.Seen(self.path).begin("x"), "reserved")
+
+
+class SubjectsForTest(unittest.TestCase):
+    """Relay.subjects_for —— 决定「门铃发给谁」的接线层。
+
+    之前这里零覆盖：E2E 测试里 fake relay 是拿测试自己塞进去的列表拼 subject，
+    于是这条真正决定去向的代码一行都没跑过。
+    """
+    TOML = """
+[nats]
+servers = ["nats://x:4222"]
+user = "u"
+password = "p"
+[routing]
+members_file = "{members}"
+notify_subject_prefix = "evt.gitea.notify"
+broadcast_subject = "evt.gitea.broadcast"
+broadcast_authors = ["mayaoyao"]
+[providers.gitea]
+path = "/gitea-hook"
+[providers.gitea.headers]
+event = "X-Gitea-Event"
+delivery = "X-Gitea-Delivery"
+signature = "X-Gitea-Signature"
+[providers.gitea.signature]
+secret = "s"
+[providers.gitea.events]
+issues = "issue"
+issue_comment = "issue_comment"
+"""
+
+    def setUp(self):
+        import app
+        d = tempfile.mkdtemp()
+        m = os.path.join(d, "m.json")
+        with open(m, "w", encoding="utf-8") as f:
+            json.dump({"members": {
+                "alice": {"host": "h1", "id": "alice"},
+                "madeng": {"host": "h2", "id": "madeng"},
+            }}, f)
+        p = os.path.join(d, "c.toml")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(self.TOML.format(members=m))
+        cfg = config_mod.load(path=p, env={})
+        self.members = core.Members(config_mod.load_members(cfg.members_file))
+        self.relay = app.Relay(cfg, self.members)
+
+    def test_mention_produces_subject(self):
+        """核心契约：evt.gitea.notify.<host>.<id>"""
+        subs = self.relay.subjects_for({"mentions": ["alice"]})
+        self.assertEqual(subs, ["evt.gitea.notify.h1.alice"])
+
+    def test_custom_prefix_is_honored(self):
+        self.relay.cfg.notify_subject_prefix = "acme.poke"
+        self.assertEqual(self.relay.subjects_for({"mentions": ["alice"]}),
+                         ["acme.poke.h1.alice"])
+
+    def test_broadcast_subject_added_for_announcement(self):
+        ev = {"kind": "issue", "action": "opened", "actor": "mayaoyao",
+              "title": "【公告】上线", "labels": []}
+        self.assertEqual(self.relay.subjects_for(ev), ["evt.gitea.broadcast"])
+
+    def test_broadcast_and_notify_combined(self):
+        ev = {"kind": "issue", "action": "opened", "actor": "mayaoyao",
+              "title": "【公告】上线", "labels": [], "assignees": ["alice"]}
+        self.assertEqual(sorted(self.relay.subjects_for(ev)),
+                         ["evt.gitea.broadcast", "evt.gitea.notify.h1.alice"])
+
+    def test_non_author_issue_is_not_broadcast(self):
+        ev = {"kind": "issue", "action": "opened", "actor": "alice",
+              "title": "【公告】上线", "labels": []}
+        self.assertEqual(self.relay.subjects_for(ev), [])
+
+    def test_unknown_login_yields_nothing(self):
+        self.assertEqual(self.relay.subjects_for({"mentions": ["nobody"]}), [])
+
+    def test_reviewers_and_assignees_both_routed(self):
+        ev = {"assignees": ["alice"], "reviewers": ["madeng"]}
+        self.assertEqual(sorted(self.relay.subjects_for(ev)),
+                         ["evt.gitea.notify.h1.alice", "evt.gitea.notify.h2.madeng"])
+
+    def test_same_recipient_not_published_twice(self):
+        ev = {"assignees": ["alice"], "mentions": ["alice"], "reviewers": ["alice"]}
+        self.assertEqual(self.relay.subjects_for(ev), ["evt.gitea.notify.h1.alice"])
+
+    def test_empty_event_yields_nothing(self):
+        self.assertEqual(self.relay.subjects_for({}), [])
 
 
 class SignatureTest(unittest.TestCase):

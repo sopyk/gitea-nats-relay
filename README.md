@@ -358,9 +358,12 @@ Gitea 的 payload 归一化（第六件的后半段）就是把 `repository` / `
 
 ### 变量 / 配置项对照
 
-配置文件尚未落地期间，现有环境变量继续生效，两者一一对应：
+配置文件落地期间，环境变量作为覆盖手段继续生效，两者一一对应。
+配置文件路径由 `CONFIG_FILE` 决定，默认 `/config/webhook2nats.toml`；**文件不存在时按纯环境变量模式运行**，不会报错。
 
 | 变量 | TOML 键 | 必填 | 说明 |
+|---|---|---|---|
+| `CONFIG_FILE` | ——（就是它本身） | 否 | 配置文件路径，默认 `/config/webhook2nats.toml` |
 |---|---|---|---|
 | `NATS_SERVERS` | `[nats] servers` | 是 | NATS 地址，多个用逗号分隔或写成数组 |
 | `NATS_USER` / `NATS_PASSWORD` | `[nats] user` / `password` | 是 | 转发器专用 NATS 账号（ACL 已限权到门铃 subject） |
@@ -443,13 +446,25 @@ Gitea 的 payload 归一化（第六件的后半段）就是把 `repository` / `
 ## HTTP 契约
 
 - `GET /healthz` → NATS 连通返回 `200 ok`，否则 `503 nats-down`
-- `POST /gitea-hook`（Gitea webhook 配置的回调地址）：
-  - `401 bad-signature` — HMAC 不匹配或没配 `WEBHOOK_SECRET`
-  - `200 duplicate` — 该 delivery 已成功处理过
-  - `409 inflight` — 同一 delivery 正在被一个重叠的重试处理
-  - `400 bad-json` — 请求体不是合法 JSON
-  - `502 publish-failed` / `504 publish-timeout` / `500 publish-error` — NATS 未确认发布；delivery **回滚**，让 Gitea 重试时复用同一 UUID，而不是被当重复丢弃
-  - `200 accepted` — 所有相关 subject 都已发布并 flush 完成；**只有这时**才把 delivery 标记为已处理
+- `POST /gitea-hook`（Gitea webhook 配置的回调地址，路径由 provider 的 `path` 决定）：
+
+| 状态 | body | 含义 | 平台的下一步 |
+|---|---|---|---|
+| `200` | `accepted` | 所有相关 subject 已发布并 flush 成功 | 记为成功。**只有这时**才把 delivery 标记为已处理 |
+| `200` | `duplicate` | 这个 delivery 早先已成功处理过 | 记为成功，不再重试 |
+| `200` | `ignored` | 事件类型不在映射表里（push 等我们不关心的） | 记为成功，不再重试 |
+| `400` | `bad-json` | 请求体不是合法 JSON 对象 | 视为失败 |
+| `400` | `bad-length` | `Content-Length` 非法 | 视为失败 |
+| `400` | `missing-delivery` | 缺少 delivery 头，无法幂等 | 视为失败。**请把 Webhook 配置补全** |
+| `401` | `bad-signature` | 签名不匹配或没配密钥 | 视为失败 |
+| `404` | `not-found` | 路径没有对应的 provider | 视为失败 |
+| `409` | `inflight` | 同一 delivery 正在被处理 | 可能重试 |
+| `413` | `payload-too-large` | 请求体超过 1 MB | 视为失败 |
+| `500` | `publish-error` / `internal-error` | 未预期异常 | 视为失败 |
+| `502` | `publish-failed` | 某个 subject 发布失败 | **用同一个 UUID 重试** |
+| `504` | `publish-timeout` | 等待 NATS 确认超时 | **用同一个 UUID 重试** |
+
+**`502` / `504` / `500` 时 delivery 会回滚** —— 平台重试不会被当成重复丢弃。所有失败路径都保证释放 inflight 占位，所以平台重投总能被正常处理，不会永远卡在 `409`。
 
 > 路径是按 provider 配的。换一个平台就是换 `path`，核心契约不变。
 
@@ -558,7 +573,8 @@ NAS 离线、或还没配 CI 镜像时用 `docker-compose.build.yml`；有 regis
 # 1) 准备两个被忽略的文件
 cp relay.env.example relay.env          # 填入 NATS 账号 + WEBHOOK_SECRET + NATS_PASSWORD
 #    并在 config/members.json 里填好 登录名 → {host, id} 映射
-#    （TOML 落地后再建 config/webhook2nats.toml，当前代码仍走环境变量）
+#    （可选）把 config/webhook2nats.example.toml 复制成 webhook2nats.toml 填好
+#    未配置时 CONFIG_FILE 指向的文件不存在，relay 会按纯环境变量模式运行
 
 # 2) 起
 docker compose up -d          # 或 docker compose -f docker-compose.build.yml up -d --build

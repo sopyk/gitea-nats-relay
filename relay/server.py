@@ -6,7 +6,13 @@ providers.py 和配置里。
 """
 import concurrent.futures
 import json
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def log_stack():
+    """统一记录未预期异常 —— 位置保留在 server.py，一眼能看出是哪一层炸的。"""
+    print("[relay] unhandled:", traceback.format_exc().strip(), flush=True)
 
 # 请求体上限。验签必须对完整 body 做，所以 body 得先读完 —— 没设上限的话，
 # 一个未认证的客户端就能靠超大 Content-Length 把进程内存吃光（实测 10MB
@@ -75,7 +81,15 @@ class Handler(BaseHTTPRequestHandler):
         if provider is None:
             self._reply(404, "not-found")
             return
+        try:
+            self._handle(provider)
+        except Exception:  # noqa
+            # 兜底：任何漏网的异常都在这里变成一个诚实的 500，而不是
+            # 异常逃出去 → 客户端连接被重置、看不到任何状态码。
+            log_stack()
+            self._reply(500, "internal-error")
 
+    def _handle(self, provider):
         body, err = self._read_body()
         if err == "bad-length":
             self._reply(400, "bad-length")
@@ -103,6 +117,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
+            self._process(provider, body, delivery)
+        except Exception:  # noqa
+            # 这一段必须 rollback：占位不释放的话，同一个 delivery
+            # 会被永久卡在 inflight，平台每次重试都只拿到一个误导性的
+            # 409（"上一次还在处理中"，实际上早就不处理了），直到进程重启。
+            self.app.seen.rollback(delivery)
+            log_stack()
+            self._reply(500, "publish-error")
+
+    def _process(self, provider, body, delivery):
+        try:
             payload = json.loads(body.decode("utf-8"))
         except Exception:  # noqa
             self.app.seen.rollback(delivery)
@@ -121,19 +146,20 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(200, "ignored")
             return
 
-        ev = provider.normalize(payload, kind, payload.get("action", "") or "")
+        # 归一化也在这里面 —— 它对 payload 结构的意外变化零容忍，
+        # 而 payload 是平台给的，不能假设它永远是文档里的形状。
+        ev = provider.normalize(payload, kind, payload.get("action") or "")
         ev["delivery"] = delivery
 
+        future = self.app.relay.submit_event(ev)
         try:
-            future = self.app.relay.submit_event(ev)
             results = future.result(timeout=self.app.cfg.publish_timeout_seconds)
         except concurrent.futures.TimeoutError:
+            # cancel() 对已在运行的协程无效，但必须调：run_coroutine_threadsafe
+            # 包装的协程还没被调度时它是能被取消的，省掉一次必然重复的门铃。
+            future.cancel()
             self.app.seen.rollback(delivery)
             self._reply(504, "publish-timeout")
-            return
-        except Exception:  # noqa
-            self.app.seen.rollback(delivery)
-            self._reply(500, "publish-error")
             return
 
         if any(not ok for _, ok in results):
@@ -150,5 +176,8 @@ def serve(app, listen):
     host, _, port = listen.rpartition(":")
     Handler.app = app
     httpd = ThreadingHTTPServer((host or "0.0.0.0", int(port)), Handler)
+    # 没有超时的 socket 会被「声明 Content-Length 然后不发数据」的客户端
+    # 无限期占住一个线程。10s 足够读完一个几 MB 的 webhook。
+    httpd.timeout = 10
     httpd.daemon_threads = True
     return httpd
