@@ -19,7 +19,7 @@ Subject 契约（服务端 ACL 锁定，默认前缀，均可用环境变量覆�
   NATS_SERVERS         例 nats://<nats-host>:4222（逗号分隔多个）
   NATS_USER / NATS_PASSWORD   gitea-relay 专用账号
   RELAY_ID             心跳标识后缀，如 <host>.gitea-relay；留空则不发心跳
-  RELAY_CLIENT_NAME    NATS 连接显示名，默认 gitea-nats-relay
+  RELAY_CLIENT_NAME    NATS 连接显示名，默认 webhook2nats
   NATS_HEARTBEAT_SECONDS       默认 60
   WEBHOOK_SECRET       Gitea webhook 配置里同一个密钥（HMAC-SHA256）
   MEMBERS_FILE         登录名 -> {host,id} 映射 JSON，默认 /config/members.json
@@ -73,7 +73,7 @@ BROADCAST_SUBJECT = os.environ.get("BROADCAST_SUBJECT", "evt.gitea.broadcast")
 
 
 def load_members():
-    path = os.environ.get("MEMBERS_FILE", "/data/members.json")
+    path = os.environ.get("MEMBERS_FILE", "/config/members.json")
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
