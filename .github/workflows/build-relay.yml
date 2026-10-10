@@ -1,0 +1,59 @@
+name: build-and-push-relay
+
+# gitea-nats-relay 镜像构建：在 GitHub 托管 runner 上 build，推到 ghcr.io。
+# NAS 只 pull 预构建镜像，不在弱性能 NAS 上编译。
+#
+# 触发：打 tag relay-v* 发正式版；push main 出 :edge；也可手工 dispatch。
+on:
+  push:
+    tags: ["relay-v*"]
+    branches: [main]
+    paths:
+      - "relay/**"
+      - ".github/workflows/build-relay.yml"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag,enable=${{ startsWith(github.ref, 'refs/tags/relay-v') }},prefix=relay-v
+            type=raw,value=edge,event=branch
+            type=raw,value=latest,event=tag
+            type=sha,format=short,event=branch
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: relay
+          file: relay/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

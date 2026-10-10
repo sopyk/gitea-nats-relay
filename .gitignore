@@ -1,0 +1,5 @@
+*.env
+relay.env
+config/
+data/
+seen.json
