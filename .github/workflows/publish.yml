@@ -1,0 +1,106 @@
+# 构建并发布多架构镜像到 GHCR。
+#
+# 为什么在这里构建而不是本地：本地是 arm64，推不出 amd64；
+# GitHub Actions 自带 QEMU，能一次产出 linux/amd64 + linux/arm64。
+#
+# 触发方式：
+#   workflow_dispatch  手动（可填 tag）
+#   push tag v*        打 v 开头的 tag 时自动发布
+#
+# 前置条件：仓库 Settings → Actions → General → Workflow permissions
+# 需设为 "Read and write permissions"，否则 GITHUB_TOKEN 推不了包。
+name: publish-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像 tag（留空则自动用分支名/短 sha）"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: build & push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # 推 GHCR 必需
+    steps:
+      - uses: actions/checkout@v4
+
+      # 自带 runner 的 buildx 只支持 runner 自身架构，
+      # 不装 QEMU 就无法交叉构建另一个架构。
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.tag }}
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./relay
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # QEMU 交叉构建偶尔会静默跳过某个架构（本地能验证的最好在这里也验证）
+      - name: Verify both architectures landed
+        env:
+          TAGS_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          # 从 metadata-action 的 json 输出里取第一个 tag 的 digest
+          digest=$(echo "$TAGS_JSON" | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          print(list(d['tags'].values())[0]['digest'])")
+          repo=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          token=$(curl -sSf \
+            "https://${REGISTRY}/token?scope=repository:${repo}:pull" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+          curl -sSf -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://${REGISTRY}/v2/${repo}/manifests/${digest}" > /tmp/m.json
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/m.json'))
+          plats = sorted({m['platform']['os']+'/'+m['platform']['architecture']
+                          for m in d.get('manifests', []) if 'platform' in m})
+          print('manifest 平台:', plats)
+          missing = {'linux/amd64','linux/arm64'} - set(plats)
+          if missing:
+              sys.exit('缺少架构: %s —— QEMU 可能静默跳过了' % sorted(missing))
+          print('✓ 双架构确认')"

@@ -1,5 +1,11 @@
 *.env
 relay.env
-config/
+# 真实配置与成员映射（bind mount 进来的，含环境值）一律不进库。
+# 用 config/* 而非 config/：目录本身被排除时 git 无法重新包含其中的文件，
+# 只有示例模板（无任何环境值）可以豁免。
+config/*
+!config/webhook2nats.example.toml
 data/
 seen.json
+__pycache__/
+*.pyc

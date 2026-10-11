@@ -1,0 +1,130 @@
+# Webhook2NATS 配置模板
+#
+# 复制成 webhook2nats.toml 后按需修改，再 bind mount 到容器的 /config/。
+#   群晖 / Linux：docker run -v /宿主机/path/config:/config:ro ...
+#   docker compose：volumes: ["./config:/config:ro"]
+#
+# 本文件里所有值都是占位符，不含任何真实环境值，可以安全地进版本库。
+# 真实配置（含口令、成员映射）请留在宿主机，不要提交。
+#
+# 优先级：环境变量 > 本文件 > 代码默认值。
+#        环境变量优先是为了兼容容器 secret 与 CI 注入。
+#
+# 格式选择 TOML 的原因：Python 3.11+ 标准库自带 tomllib，零新增依赖；
+# 重复键会直接报错而不是静默取最后一个；缩进不敏感，NAS 上手改不会被
+# 粘贴进来的 Tab 坑到。（YAML 需要额外装 PyYAML，且 password: 123456
+# 会被隐式解析成整数。）
+
+# ── 服务自身 ────────────────────────────────────────────────
+[service]
+# HTTP 监听地址
+listen = "0.0.0.0:8090"
+
+# NATS 连接显示名，便于在 nats-server 的连接列表里认出自己
+client_name = "webhook2nats"
+
+# 心跳标识后缀，最终发布的 subject 是 hb.<relay_id>。
+# 留空则不发心跳。
+relay_id = "<host>.webhook2nats"
+
+# 心跳间隔（秒）
+heartbeat_seconds = 60
+
+# 等待 NATS 发布确认（flush）的超时（秒）。
+# 该值会直接传给 nats.py 的 flush(timeout=...)，不是 HTTP 层的事务超时。
+publish_timeout_seconds = 3
+
+# ── NATS 连接 ──────────────────────────────────────────────
+[nats]
+# 多个地址逗号或数组分隔均可
+servers = ["nats://<nats-host>:4222"]
+
+# 转发器专用账号，服务端 ACL 已限权到门铃 subject
+user = "<nats-user>"
+password = "<nats-password>"
+
+# ── 路由 / 收件人解析 ──────────────────────────────────────
+[routing]
+# 登录名 → {host, id} 映射 JSON，只读挂载
+members_file = "/config/members.json"
+
+# 定向通知 subject 前缀，最终 subject 为 <prefix>.<host>.<id>
+notify_subject_prefix = "evt.gitea.notify"
+
+# 全厅公告 subject
+broadcast_subject = "evt.gitea.broadcast"
+
+# 允许走全厅公告的作者登录名。留空 = 不发任何公告。
+# 代码里没有内置任何默认作者。
+broadcast_authors = ["<login>", "<login>"]
+
+# ── 去重状态 ──────────────────────────────────────────────
+[dedup]
+# 可写卷。LRU 容量，条目超过后淘汰最旧的。
+file = "/data/seen.json"
+capacity = 2000
+
+# ── Provider：接入一个 Webhook 平台 ────────────────────────
+#
+# 通用通道的核心：接入一个新平台 = 声明 5 件事。
+#   1. 路由路径         path
+#   2. 事件类型头       headers.event      粗：归一化组名
+#   3. 精确触发头       headers.event_type 细：可选，部分平台只有一个头
+#   4. 投递 ID 头       headers.delivery
+#   5. 验签算法与位置    signature.*
+#   6. 事件名 → 统一事件类型的映射   events / event_types
+#
+# 为什么需要「粗 + 细」两个事件头：
+# 有些平台会把多个触发器折叠成同一个组名。以 Gitea 为例，「请求评审」
+# (pull_request_review_request)、「推 commit」(pull_request_sync)、
+# 「新开 PR」(pull_request) 三者在 X-Gitea-Event 里**都是 pull_request**，
+# 只有 X-Gitea-Event-Type 才区分得开。不读细头就做不到「请求评审」路由。
+#
+# 只有 GitHub 这类「单个头本身就精确」的平台才把 headers.event_type 留空 ——
+# 此时下面整张 [providers.gitea.event_types] 不生效，退化为单表匹配。
+#
+# ⚠️ 两个坑：
+# 1. 表名/键名写错**不会报错**（TOML 只校验语法不校验 schema），配置会静默失效。
+#    未知键将在启动时被校验并拒绝。详见 README「配置校验的风险」。
+# 2. Gitea 的事件名只写平台**实际发出的 header 值**，不要照抄文档里的分类名。
+#    评审类事件在 X-Gitea-Event 里是 pull_request_approved /
+#    pull_request_rejected / pull_request_comment 三个独立值，
+#    并不存在 "pull_request_review" 这个 header 值 —— 后者只是 Gitea
+#    建 webhook 时用的分组配置键，从不投递。照抄会静默丢掉全部评审事件。
+
+[providers.gitea]
+enabled = true
+path = "/gitea-hook"
+
+[providers.gitea.headers]
+# 粗头：归一化组名（push / issues / pull_request / issue_comment …）
+event = "X-Gitea-Event"
+# 细头：精确触发器。**可选** —— 只有粗头的平台整行删掉即可。
+event_type = "X-Gitea-Event-Type"
+delivery = "X-Gitea-Delivery"
+signature = "X-Gitea-Signature"
+
+[providers.gitea.signature]
+# hmac-sha256 | hmac-sha1 | hmac-sha512
+algorithm = "hmac-sha256"
+
+# HMAC 密钥。也可用环境变量 WEBHOOK_SECRET 注入（容器 secret 的推荐方式），
+# 环境变量优先于本文件。
+secret = "<与 Gitea webhook 配置里同一个密钥>"
+
+# 粗头映射表。**兼底** —— 先查下面那张 event_types，未命中才查这里。
+[providers.gitea.events]
+issues = "issue"
+issue_comment = "issue_comment"
+pull_request = "pull_request"
+pull_request_approved = "review"
+pull_request_rejected = "review"
+pull_request_comment = "review"
+
+# 细头映射表。**优先于上面的 events**。
+# 只写「与 [events] 结果不同」的条目；未列出的精确触发器自动回落到 [events]。
+# 完整对照见 README「Gitea 的两个事件头」。
+[providers.gitea.event_types]
+# 「请求评审」必须单列：它在粗头里是 pull_request，与「新开 PR」「推 commit」
+# 完全无法区分。不单列就做不到 README 承诺的「请求评审」路由。
+pull_request_review_request = "review"

@@ -1,0 +1,66 @@
+# Webhook2NATS — 从源码构建
+#
+# 适用场景：NAS 上没有从 registry 拉镜像的条件（离线 / 内网 / 还没配 CI），
+# 或者你就是要用当前 dev 分支的代码而不是已发布的版本。
+#
+# 与 docker-compose.yml 的唯一差异是镜像来源：
+#   本文件     build: ./relay        → 在你本地构建
+#   那个文件   image: ghcr.io/...    → 拉预构建镜像
+# 其余（挂载、env_file、加固项）完全一致，改动时请同步两份。
+#
+# 用法：
+#   docker compose -f docker-compose.build.yml up -d --build
+#   curl -s localhost:8090/healthz      # → ok
+#
+# 构建需要联网拉 nats-py（约几百 KB）。镜像本身不含任何环境值，
+# 所以同一个不可变镜像可以在任何环境跑。
+
+services:
+  webhook2nats:
+    # 上下文是 relay/ —— Dockerfile 里的 COPY server.py 是相对构建上下文的
+    build: ./relay
+    # 固定打本地标签，避免和 registry 上的 latest 混淆
+    image: webhook2nats:local
+
+    container_name: webhook2nats
+    restart: unless-stopped
+
+    ports:
+      - "8090:8090"
+
+    volumes:
+      # 配置目录：只读。容器改不了 members.json，也就改不了门铃去向。
+      - ./config:/config:ro
+      # 去重状态：需要可写。与配置目录物理分开，便于备份/重建。
+      - ./data:/data
+
+    # 密钥走这里，不走 volumes —— Docker 在宿主侧读取后注入为环境变量，
+    # 该文件不会进入容器的文件系统。详见 README「安全说明」。
+    env_file:
+      - ./relay.env
+
+    environment:
+      # 刻意**不**在这里设 MEMBERS_FILE / DEDUP_FILE —— 代码默认值就是这两个路径，
+      # 而环境变量优先级高于配置文件，在这里重复一遍只会静默盖掉
+      # config/webhook2nats.toml 里的设置，且没有任何提示。
+      # 需要改路径请改配置文件；只有「想覆盖配置文件」时才用环境变量。
+      TZ: "Asia/Shanghai"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 这台服务只需要「读 body + 出网连 NATS」，不需要任何特权。
+    # 监听 8090 是高位端口，去掉 NET_BIND_SERVICE 也能正常启动。
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # 更硬的选项（默认关闭）：除了 /data 没有任何理由写盘。
+    # 配合上面的 PYTHONDONTWRITEBYTECODE 可避免写 .pyc 失败。
+    # read_only: true
+    # tmpfs:
+    #   - /tmp
