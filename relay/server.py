@@ -73,19 +73,27 @@ class Handler(BaseHTTPRequestHandler):
             self._drain()
             self._reply(404, "not-found")
 
-    def _drain(self):
-        """把请求体从 socket 里读干净。
+    def _drain(self, hard_close_over=None):
+        """把请求体从 socket 里读干净，否则 keep-alive 下残余字节会被当成
+        下一个请求行去解析 —— 表现为莫名其妙的 400 加连接关闭。
 
-        keep-alive 下如果直接回响应就返回，剩下的 body 字节会被当成下一个请求行
-        去解析 —— 表现为莫名其妙的 400 加连接关闭。
+        hard_close_over：超过这个大小就不真读了，直接关连接。超大 body 读它
+        没有意义（客户端可能正在慢慢发），而且留着连接等一个必然失败的请求
+        白占一个线程。
         """
         try:
             n = int(self.headers.get("Content-Length", "0") or 0)
         except (TypeError, ValueError):
+            # Content-Length 非法：客户端声称要发的字节数根本不可知，
+            # 无法确定还剩多少没读。这条连接不能复用，只能关掉。
+            self.close_connection = True
             return
-        # 超大 body 没有必要真读（客户端可能正在慢慢发），关连接即可，
-        # 所以这里限量并把连接标记为不再复用。
-        if n > DRAIN_LIMIT:
+        if n <= 0:
+            return  # 本来就没有 body，连接可继续复用
+        limit = DRAIN_LIMIT if hard_close_over is None else hard_close_over
+        if n > limit:
+            # 已经回了 4xx 且读不完：这条连接已经没救了，必须关掉。
+            # 但要先回响应，否则客户端只看到 RST 而不是 413。
             self.close_connection = True
             return
         remaining = n
@@ -136,8 +144,11 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(400, "bad-length")
             return
         if err == "too-large":
-            self._drain()
+            # 顺序很重要：先回 413 再关连接。反过来的话客户端只看到
+            # RST/连接重置，拿不到状态码，也无从知道是超限而不是网络问题。
+            # body 读不完（可能比上限大得多）就不 drain，直接标记关连接。
             self._reply(413, "payload-too-large")
+            self._drain()
             return
 
         if not provider.verify(body, self.headers):
