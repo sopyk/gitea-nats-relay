@@ -61,8 +61,45 @@ broadcast_authors = ["<login>", "<login>"]
 # ── 去重状态 ──────────────────────────────────────────────
 [dedup]
 # 可写卷。LRU 容量，条目超过后淘汰最旧的。
+# 上限让文件有界：2000 个 UUID 约 78KB，重新加载约 2ms。
 file = "/data/seen.json"
 capacity = 2000
+
+# ── 日志 ────────────────────────────────────────────────────
+#
+# 整段可以省略，省略时等价于下面这些默认值：纯 stdout、info、text、不记正文。
+# 日志是附加能力，不配也能正常跑。
+#
+# 日志里只允许出现「已经发给 Agent 的字段」（repo/number/actor/mentions/
+# subjects/delivery…）—— 这些字段本来就在 NATS 消息里，Agent 已经持有，
+# 再记一遍不增加暴露面。评论正文与签名头一律不进日志。
+#
+# 想按 delivery 把日志和某条门铃对上号，靠的是双方共有的那个 UUID：
+#   grep 'delivery=b1f4c9e2' relay.log
+[logging]
+# debug / info / warning / error
+# info = 投递成功与失败每请求一行；debug 额外记重复、忽略、请求体大小等。
+level = "info"
+
+# text（key=value，给人看）/ json（一行一个 JSON，给 log shipper 收）。
+# 群晖的 docker logs 里 key=value 最顺眼，所以默认 text。
+format = "text"
+
+# 额外的滚动日志文件。留空 = 只写 stdout。
+# 父目录会自动创建；创建失败会降级成只写 stdout 并打一条警告，
+# **不会**让服务起不来 —— 日志是附加能力，不能反过来把服务搞挂。
+# file = "/data/logs/relay.log"
+
+# 轮转上限与保留份数：5MB × 5 ≈ 25MB，与 compose 里 stdout 的 10m×3 同量级。
+# max_bytes = 5242880
+# backups = 5
+
+# 唯一会记评论正文的开关，默认关。
+#
+# 只在一种情况下需要临时打开：「正文里明明有 @alice，但正则没抽到」。
+# 这时消息里 mentions 是空的，日志里也是空的 —— 两边一样，看不出是
+# 「没提到」还是「提到了没认出来」。开一次抓完就关回去。
+# log_bodies = false
 
 # ── Provider：接入一个 Webhook 平台 ────────────────────────
 #

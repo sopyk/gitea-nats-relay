@@ -4,9 +4,12 @@
 测试只能整个替换掉 NATS 客户端才能跑，等于没测。
 """
 import json
+import logging
 import os
 import threading
 from collections import OrderedDict
+
+import logs
 
 
 class Seen:
@@ -34,8 +37,9 @@ class Seen:
         # 于是 relay 重启后会把所有事件重发一遍。宁可当作空状态重来。
         if not isinstance(data, list) or not all(isinstance(k, str) for k in data):
             if data:
-                print(f"[relay] WARN dedup file {path} 内容不是字符串数组，已按空状态重建",
-                      flush=True)
+                logs.event(logs.get_logger(), logging.WARNING,
+                           "去重文件内容不是字符串数组，已按空状态重建",
+                           path=path)
             data = []
         self.od.update({k: True for k in data})
         while len(self.od) > self.cap:

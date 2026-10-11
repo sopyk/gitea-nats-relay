@@ -7,6 +7,7 @@
 """
 import asyncio
 import json
+import logging
 import os
 import signal
 import sys
@@ -16,12 +17,28 @@ import nats
 
 import config as config_mod
 import core
+import logs as logs_mod
 import providers as providers_mod
 import server as server_mod
 
+logger = logs_mod.get_logger()
 
-def log(*a):
-    print("[relay]", *a, flush=True)
+
+def log(message, **fields):
+    """结构化日志的简写。字段一律走 extra，不拼进 message。
+
+    保留这个名字是为了让既有调用点不必大改 —— 但新写的代码直接用
+    logs_mod.event()，级别更明确。
+    """
+    logs_mod.event(logger, logging.INFO, message, **fields)
+
+
+def warn(message, **fields):
+    logs_mod.event(logger, logging.WARNING, message, **fields)
+
+
+def error(message, **fields):
+    logs_mod.event(logger, logging.ERROR, message, **fields)
 
 
 class Relay:
@@ -43,12 +60,12 @@ class Relay:
             max_reconnect_attempts=-1,
             name=self.cfg.client_name,
         )
-        log("NATS connected:", self.cfg.nats_servers)
+        log("NATS connected", servers=self.cfg.nats_servers)
         self.loop = asyncio.get_running_loop()
         if self.cfg.relay_id:
             asyncio.create_task(self._heartbeat())
         else:
-            log("RELAY_ID not set; heartbeat disabled")
+            warn("RELAY_ID 未设置，心跳已禁用")
 
     async def _heartbeat(self):
         subject = f"hb.{self.cfg.relay_id}"
@@ -58,7 +75,9 @@ class Relay:
                                        f"hb|{self.cfg.relay_id}|online".encode())
                 await self.nc.flush()
             except Exception as e:  # noqa
-                log("heartbeat error:", e)
+                # 心跳是后台任务，异常不能让它静默死掉 —— 否则 relay_id
+                # 会一直显示在线，实际却早就不发心跳了。
+                warn("心跳发送失败", relay_id=self.cfg.relay_id, error=repr(e))
             await asyncio.sleep(self.cfg.heartbeat_seconds)
 
     def _nats_timeout(self):
@@ -98,7 +117,7 @@ class Relay:
                     await self._publish(subject, ev)
                     results.append((subject, True))
                 except Exception as e:  # noqa
-                    log("publish failed:", subject, e)
+                    error("发布失败", subject=subject, error=repr(e))
                     results.append((subject, False))
             return results
         return asyncio.run_coroutine_threadsafe(run(), self.loop)
@@ -118,9 +137,9 @@ class Relay:
             return
         try:
             await asyncio.wait_for(self.nc.drain(), timeout=5)
-            log("NATS drained")
+            log("NATS 已排空")
         except Exception as e:  # noqa
-            log("drain failed, closing anyway:", e)
+            error("排空失败，仍将关闭", error=repr(e))
             try:
                 await self.nc.close()
             except Exception:  # noqa
@@ -128,21 +147,29 @@ class Relay:
 
 
 async def amain():
+    # 配置还没加载，所以这里只有 stdout handler —— 那正是我们要的：
+    # 「配置错了」这件事本身必须先打出来，才谈得上按配置写日志文件。
     try:
         cfg = config_mod.load()
     except config_mod.ConfigError as e:
-        log("ERROR:", e)
+        error("配置不合法，启动中止", detail=str(e))
         sys.exit(1)
     except Exception as e:  # noqa
         # 配置层的 bug（比如某个字段类型没覆盖到）会以 ValueError/TypeError 冒出来。
         # 那时至少要打印得比裸 traceback 清楚 —— 运维只关心「哪项配置不对」。
-        log("ERROR: 加载配置时发生未预期的异常：", type(e).__name__, e)
-        log("请检查配置文件与 server.py:config_mod.load 的类型覆盖是否一致")
+        error("加载配置时发生未预期的异常", exc=type(e).__name__, detail=str(e))
+        error("请检查配置文件与 config.py 的类型覆盖是否一致")
         sys.exit(1)
+
+    # 从这里开始才有真正的日志配置。
+    degraded = logs_mod.setup(cfg.logging)
+    if degraded:
+        warn(degraded)
+
     for w in getattr(cfg, "warnings", []):
-        log("WARN:", w)
+        warn(w)
     if not cfg.broadcast_authors:
-        log("WARN: broadcast_authors 未配置，全厅公告已禁用")
+        warn("broadcast_authors 未配置，全厅公告已禁用")
 
     try:
         members_raw = config_mod.load_members(cfg.members_file)
@@ -150,13 +177,13 @@ async def amain():
         log("ERROR:", e)
         sys.exit(1)
     members = core.Members(members_raw)
-    log("members loaded:", len(members))
+    log("成员表已加载", count=len(members), file=cfg.members_file)
 
     seen = core.Seen(cfg.dedup_file, cfg.dedup_capacity)
     try:
         registry = providers_mod.build_registry(cfg)
     except ValueError as e:
-        log("ERROR:", e)
+        error("provider 注册失败，启动中止", detail=str(e))
         sys.exit(1)
 
     relay = Relay(cfg, members)
@@ -164,13 +191,13 @@ async def amain():
 
     app = server_mod.App(cfg, registry, members, seen, relay)
     httpd = server_mod.serve(app, cfg.listen)
-    log("listening on", cfg.listen, "providers:", list(registry))
+    log("开始监听", listen=cfg.listen, providers=list(registry))
 
     stop = asyncio.Event()
 
     def _on_signal():
         """信号处理器跑在事件循环线程里，所以不能阻塞地关 HTTP server。"""
-        log("shutdown signal received")
+        warn("收到关停信号，开始优雅关闭")
         relay.shutdown()
         threading.Thread(target=httpd.shutdown, daemon=True).start()
         stop.set()
@@ -186,11 +213,13 @@ async def amain():
     # 否则 drain 完连接又冒出新的发布。
     httpd.server_close()
     await relay.aclose()
-    log("server stopped")
+    log("服务已停止")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
+        # Ctrl-C 走信号处理器已经关过一次了，这里只是别让 Python 再打一段
+        # 难看的 traceback 盖住真正的关停日志。
         sys.exit(0)

@@ -75,6 +75,14 @@ class Provider:
     def read_delivery(self, headers):
         return headers.get(self.cfg.delivery_header, "")
 
+    def read_event(self, headers):
+        """平台原始事件头，只用于日志。
+
+        刻意不参与任何业务判断 —— 日志里要能看到「平台到底发了什么」，
+        这样「我们没认出来」和「平台根本没发这个事件」是两回事，一眼可辨。
+        """
+        return headers.get(self.cfg.event_header, "")
+
     def resolve_kind(self, headers):
         """返回统一事件类型；平台发的事件我们不认则返回 None（→ 200 ignored）。"""
         event = headers.get(self.cfg.event_header, "")

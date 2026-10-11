@@ -128,6 +128,16 @@ class _Shim:
 
 
 class HttpTestBase(unittest.TestCase):
+    @staticmethod
+    def err_of(body):
+        """从响应体取状态名。
+
+        响应契约是 JSON（见 README「HTTP 契约」）：成功给 `status`，
+        失败给 `error`。测试断言这个字段而不是整段字节 —— 整段字节断言
+        会在响应里多带一个 delivery 时集体变红，却看不出是什么变了。
+        """
+        doc = json.loads(body)
+        return doc.get("error") or doc.get("status")
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         members = os.path.join(self.tmp, "members.json")
@@ -303,7 +313,7 @@ class WebhookBehaviorTest(HttpTestBase):
         p = fixtures.issue_comment(body="@mayaoyao 请处理，@unknown 忽略")
         status, body = self.post(p)
         self.assertEqual(status, 200)
-        self.assertEqual(body, b"accepted")
+        self.assertEqual(self.err_of(body), "accepted")
         subjects = [s for s, _ in self.relay.published]
         self.assertEqual(subjects, ["evt.gitea.notify.h1.mayaoyao"])
         _, ev = self.relay.published[0]
@@ -334,7 +344,7 @@ class WebhookBehaviorTest(HttpTestBase):
     def test_duplicate_delivery_does_not_republish(self):
         p = fixtures.issue_comment(body="@mayaoyao 看看")
         self.assertEqual(self.post(p, delivery="dup")[0], 200)
-        self.assertEqual(self.post(p, delivery="dup")[1], b"duplicate")
+        self.assertEqual(self.err_of(self.post(p, delivery="dup")[1]), "duplicate")
         self.assertEqual(len(self.relay.published), 1)
 
     def test_missing_delivery_rejected(self):
@@ -342,7 +352,7 @@ class WebhookBehaviorTest(HttpTestBase):
         p = fixtures.issue_comment(body="@mayaoyao 看看")
         status, body = self.post(p, no_delivery=True)
         self.assertEqual(status, 400)
-        self.assertEqual(body, b"missing-delivery")
+        self.assertEqual(self.err_of(body), "missing-delivery")
         self.assertEqual(len(self.relay.published), 0)
 
     def test_review_event_accepted(self):
@@ -381,7 +391,7 @@ class WebhookBehaviorTest(HttpTestBase):
     def test_bad_signature_rejected(self):
         status, body = self.post(fixtures.issue_comment(), secret="wrong")
         self.assertEqual(status, 401)
-        self.assertEqual(body, b"bad-signature")
+        self.assertEqual(self.err_of(body), "bad-signature")
         self.assertEqual(len(self.relay.published), 0)
 
     def test_no_signature_header_rejected(self):
@@ -407,7 +417,7 @@ class WebhookBehaviorTest(HttpTestBase):
     def test_bad_json_returns_400_and_allows_retry(self):
         status, body = self.post(None, raw_body=b"{not json")
         self.assertEqual(status, 400)
-        self.assertEqual(body, b"bad-json")
+        self.assertEqual(self.err_of(body), "bad-json")
         # 回滚了 delivery，同一 UUID 可以重来
         self.assertEqual(self.post(None, raw_body=b"{not json")[0], 400)
 
@@ -418,11 +428,13 @@ class WebhookBehaviorTest(HttpTestBase):
     def test_publish_failure_rolls_back_and_allows_retry(self):
         p = fixtures.issue_comment(body="@mayaoyao 看看")
         self.relay.fail_subjects = {"evt.gitea.notify.h1.mayaoyao"}
-        self.assertEqual(self.post(p, delivery="f1"), (502, b"publish-failed"))
+        status, body = self.post(p, delivery="f1")
+        self.assertEqual((status, self.err_of(body)), (502, "publish-failed"))
         # 同一 delivery 必须还能重试，不能被当重复丢弃
         self.relay.fail_subjects = set()
-        self.assertEqual(self.post(p, delivery="f1"), (200, b"accepted"))
-        self.assertEqual(self.post(p, delivery="f1"), (200, b"duplicate"))
+        status, body = self.post(p, delivery="f1")
+        self.assertEqual((status, self.err_of(body)), (200, "accepted"))
+        self.assertEqual(self.err_of(self.post(p, delivery="f1")[1]), "duplicate")
 
     def test_publish_timeout_rolls_back_and_allows_retry(self):
         """超时后 delivery 必须回滚，平台能用同一 UUID 重投。"""
@@ -430,20 +442,21 @@ class WebhookBehaviorTest(HttpTestBase):
         self.relay.hang = True
         status, body = self.post(p, delivery="t1")
         self.assertEqual(status, 504)
-        self.assertEqual(body, b"publish-timeout")
+        self.assertEqual(self.err_of(body), "publish-timeout")
         self.assertGreaterEqual(self.relay.cancelled, 1, "超时应尝试 cancel")
         app = self.httpd.RequestHandlerClass.app
         self.assertNotIn("t1", app.seen.inflight)
         self.relay.hang = False
-        self.assertEqual(self.post(p, delivery="t1"), (200, b"accepted"))
+        status, body = self.post(p, delivery="t1")
+        self.assertEqual((status, self.err_of(body)), (200, "accepted"))
 
     def test_unknown_event_ignored_not_dropped(self):
         status, body = self.post(fixtures.issue_comment(), event="push", delivery="x1")
         self.assertEqual(status, 200)
-        self.assertEqual(body, b"ignored")
+        self.assertEqual(self.err_of(body), "ignored")
         self.assertEqual(self.relay.published, [])
-        self.assertEqual(self.post(fixtures.issue_comment(), event="push",
-                                   delivery="x1")[1], b"duplicate")
+        self.assertEqual(self.err_of(self.post(fixtures.issue_comment(), event="push",
+                                                   delivery="x1")[1]), "duplicate")
 
     def test_unknown_path_404(self):
         self.assertEqual(self.post(fixtures.issue_comment(), path="/nope")[0], 404)
@@ -483,7 +496,7 @@ class WebhookBehaviorTest(HttpTestBase):
         try:
             status, body = self.post(fixtures.issue_comment(), delivery="BOOM")
             self.assertEqual(status, 500)
-            self.assertEqual(body, b"publish-error")
+            self.assertEqual(self.err_of(body), "publish-error")
             self.assertNotIn("BOOM", app.seen.inflight)
         finally:
             app.registry["/gitea-hook"].normalizer = original
@@ -516,7 +529,7 @@ class WebhookBehaviorTest(HttpTestBase):
                 f"X-Gitea-Signature: \xe4\xe4\r\n\r\n").encode("latin-1")
         status, resp = self._http(head + body)
         self.assertEqual(status, 401, "非 ASCII 签名头应被干净地拒绝为 401")
-        self.assertEqual(resp, b"bad-signature")
+        self.assertEqual(self.err_of(resp), "bad-signature")
 
     def test_socket_timeout_is_configured(self):
         """per-connection 超时必须真的设上。
@@ -547,7 +560,7 @@ class WebhookBehaviorTest(HttpTestBase):
                b"Content-Length: not-a-number\r\nX-Gitea-Event: issues\r\n\r\n")
         results = self._pipelined([bad])
         self.assertEqual(results[0][0], 400)
-        self.assertEqual(results[0][1], b"bad-length")
+        self.assertEqual(self.err_of(results[0][1]), "bad-length")
 
     def test_drain_protects_keep_alive_after_404(self):
         """404 路径必须 drain，否则下一个请求被残余字节污染。
@@ -630,14 +643,14 @@ class WebhookBehaviorTest(HttpTestBase):
         big = b"x" * (server_mod.MAX_BODY_BYTES + 4096)
         status, body = self._http(self._raw(big, delivery="big", event="issues"))
         self.assertEqual(status, 413)
-        self.assertEqual(body, b"payload-too-large")
+        self.assertEqual(self.err_of(body), "payload-too-large")
 
 
 class HealthTest(HttpTestBase):
     def test_healthz_ok(self):
         status, body = self._http(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
         self.assertEqual(status, 200)
-        self.assertEqual(body, b"ok")
+        self.assertEqual(self.err_of(body), "ok")
 
     def test_unknown_get_404(self):
         status, _ = self._http(b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n")
