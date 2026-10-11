@@ -43,7 +43,7 @@ password = "p"
 
 [routing]
 members_file = "{members}"
-broadcast_authors = ["mayaoyao"]
+broadcast_authors = ["carol"]
 
 [dedup]
 file = "{dedup}"
@@ -143,8 +143,8 @@ class HttpTestBase(unittest.TestCase):
         members = os.path.join(self.tmp, "members.json")
         with open(members, "w", encoding="utf-8") as f:
             json.dump({"members": {
-                "mayaoyao": {"host": "h1", "id": "mayaoyao"},
-                "madeng": {"host": "h2", "id": "madeng"},
+                "carol": {"host": "h1", "id": "carol"},
+                "dave": {"host": "h2", "id": "dave"},
             }}, f)
         cfg_path = os.path.join(self.tmp, "c.toml")
         with open(cfg_path, "w", encoding="utf-8") as f:
@@ -310,29 +310,29 @@ class WebhookBehaviorTest(HttpTestBase):
         之前的 fake 是拿测试自设的 targets 拼 subject，把 extract_targets
         改成永远返回 [] 时全套测试依然全绿。
         """
-        p = fixtures.issue_comment(body="@mayaoyao 请处理，@unknown 忽略")
+        p = fixtures.issue_comment(body="@carol 请处理，@unknown 忽略")
         status, body = self.post(p)
         self.assertEqual(status, 200)
         self.assertEqual(self.err_of(body), "accepted")
         subjects = [s for s, _ in self.relay.published]
-        self.assertEqual(subjects, ["evt.gitea.notify.h1.mayaoyao"])
+        self.assertEqual(subjects, ["evt.gitea.notify.h1.carol"])
         _, ev = self.relay.published[0]
-        self.assertIn("mayaoyao", ev["mentions"])
+        self.assertIn("carol", ev["mentions"])
         # 未注册的人不路由，但保留在 mentions 里供展示
         self.assertIn("unknown", ev["mentions"])
 
     def test_mention_and_assignee_both_notified(self):
-        p = fixtures.issue_comment(body="@madeng 你也看看")
-        p["issue"]["assignees"] = [{"login": "mayaoyao"}]
+        p = fixtures.issue_comment(body="@dave 你也看看")
+        p["issue"]["assignees"] = [{"login": "carol"}]
         self.post(p)
         subjects = sorted(s for s, _ in self.relay.published)
-        self.assertEqual(subjects, ["evt.gitea.notify.h1.mayaoyao",
-                                    "evt.gitea.notify.h2.madeng"])
+        self.assertEqual(subjects, ["evt.gitea.notify.h1.carol",
+                                    "evt.gitea.notify.h2.dave"])
 
     def test_unmapped_login_publishes_nothing(self):
         """不在成员映射里的人**不该**收到任何门铃。
 
-        payload 里的 assignees 默认是 mayaoyao，这里要清掉，否则它仍会被通知，
+        payload 里的 assignees 默认是 carol，这里要清掉，否则它仍会被通知，
         断言就测不出「未知 @提及不路由」了。
         """
         p = fixtures.issue_comment(body="@nobody 在吗")
@@ -342,14 +342,14 @@ class WebhookBehaviorTest(HttpTestBase):
                          "未注册的 @提及不该产生任何发布")
 
     def test_duplicate_delivery_does_not_republish(self):
-        p = fixtures.issue_comment(body="@mayaoyao 看看")
+        p = fixtures.issue_comment(body="@carol 看看")
         self.assertEqual(self.post(p, delivery="dup")[0], 200)
         self.assertEqual(self.err_of(self.post(p, delivery="dup")[1]), "duplicate")
         self.assertEqual(len(self.relay.published), 1)
 
     def test_missing_delivery_rejected(self):
         """没有 delivery 头就无法幂等 —— 放行等于每次重投都重复叫醒。"""
-        p = fixtures.issue_comment(body="@mayaoyao 看看")
+        p = fixtures.issue_comment(body="@carol 看看")
         status, body = self.post(p, no_delivery=True)
         self.assertEqual(status, 400)
         self.assertEqual(self.err_of(body), "missing-delivery")
@@ -363,18 +363,18 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertEqual(status, 200)
         _, ev = self.relay.published[0]
         self.assertEqual(ev["kind"], "review")
-        self.assertEqual(ev["mentions"], ["mayaoyao"])
+        self.assertEqual(ev["mentions"], ["carol"])
         self.assertEqual(ev["review_state"], "pull_request_review_approved")
         # 评审正文里的 @提及要能路由到人（读的是 review.content 不是 body）。
-        # 收件人有两个来源：正文里的 @mayaoyao，以及 PR 对象上的评审人 madeng。
+        # 收件人有两个来源：正文里的 @carol，以及 PR 对象上的评审人 dave。
         subjects = sorted(s for s, _ in self.relay.published)
-        self.assertEqual(subjects, ["evt.gitea.notify.h1.mayaoyao",
-                                    "evt.gitea.notify.h2.madeng"])
+        self.assertEqual(subjects, ["evt.gitea.notify.h1.carol",
+                                    "evt.gitea.notify.h2.dave"])
 
     def test_review_request_routes_to_requested_reviewer(self):
         """请求评审：真正被请求的人在顶层 requested_reviewer 单数字段里，
         此时 PR 上的 requested_reviewers 是空的 —— 读不到它就通知不到人。"""
-        p = fixtures.review_requested("madeng")
+        p = fixtures.review_requested("dave")
         self.assertEqual(p["pull_request"]["requested_reviewers"], [],
                          "fixture 前提：PR 自身的评审人列表此时应为空")
         status, _ = self.post(p, event="pull_request",
@@ -382,10 +382,10 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertEqual(status, 200)
         _, ev = self.relay.published[0]
         self.assertEqual(ev["kind"], "review")
-        self.assertIn("madeng", ev["reviewers"],
+        self.assertIn("dave", ev["reviewers"],
                       "被指派的评审人必须出现在收件人里")
         subjects = sorted(s for s, _ in self.relay.published)
-        self.assertIn("evt.gitea.notify.h2.madeng", subjects,
+        self.assertIn("evt.gitea.notify.h2.dave", subjects,
                       "请求评审必须通知到被指派的那个人")
 
     def test_bad_signature_rejected(self):
@@ -401,7 +401,7 @@ class WebhookBehaviorTest(HttpTestBase):
 
     def test_tampered_body_rejected(self):
         """签名之后改动请求体 —— 必须被拒。"""
-        p = fixtures.issue_comment(body="@mayaoyao 看")
+        p = fixtures.issue_comment(body="@carol 看")
         body = json.dumps(p, ensure_ascii=False).encode()
         sig = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
         tampered = body.replace("看".encode(), "修".encode())
@@ -426,8 +426,8 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertEqual(status, 400)
 
     def test_publish_failure_rolls_back_and_allows_retry(self):
-        p = fixtures.issue_comment(body="@mayaoyao 看看")
-        self.relay.fail_subjects = {"evt.gitea.notify.h1.mayaoyao"}
+        p = fixtures.issue_comment(body="@carol 看看")
+        self.relay.fail_subjects = {"evt.gitea.notify.h1.carol"}
         status, body = self.post(p, delivery="f1")
         self.assertEqual((status, self.err_of(body)), (502, "publish-failed"))
         # 同一 delivery 必须还能重试，不能被当重复丢弃
@@ -438,7 +438,7 @@ class WebhookBehaviorTest(HttpTestBase):
 
     def test_publish_timeout_rolls_back_and_allows_retry(self):
         """超时后 delivery 必须回滚，平台能用同一 UUID 重投。"""
-        p = fixtures.issue_comment(body="@mayaoyao 看看")
+        p = fixtures.issue_comment(body="@carol 看看")
         self.relay.hang = True
         status, body = self.post(p, delivery="t1")
         self.assertEqual(status, 504)
@@ -462,7 +462,7 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertEqual(self.post(fixtures.issue_comment(), path="/nope")[0], 404)
 
     def test_dedup_survives_restart(self):
-        p = fixtures.issue_comment(body="@mayaoyao 看看")
+        p = fixtures.issue_comment(body="@carol 看看")
         self.assertEqual(self.post(p, delivery="persist")[0], 200)
         app = self.httpd.RequestHandlerClass.app
         fresh = core.Seen(app.seen.path, app.seen.cap)
@@ -573,7 +573,7 @@ class WebhookBehaviorTest(HttpTestBase):
                f"X-Gitea-Event: issues\r\n"
                f"Content-Length: {len(body)}\r\n\r\n").encode() + body
         results = self._pipelined([bad, self._signed_post(
-            fixtures.issue_comment(body="@mayaoyao 看看"), "after-404")])
+            fixtures.issue_comment(body="@carol 看看"), "after-404")])
         self.assertEqual(results[0][0], 404)
         self.assertEqual(len(results), 2, "404 之后连接应继续可用")
         self.assertEqual(results[1][0], 200,
@@ -584,7 +584,7 @@ class WebhookBehaviorTest(HttpTestBase):
 
         变异测试：把 is_broadcast 改成永远 False 时这条必须红。
         """
-        ev = fixtures.issue_event(action="opened", actor="mayaoyao")
+        ev = fixtures.issue_event(action="opened", actor="carol")
         ev["issue"] = fixtures._issue(title="【公告】今晚维护")
         ev["issue"]["assignees"] = []
         status, _ = self.post(ev, event="issues", delivery="bc1")
@@ -595,7 +595,7 @@ class WebhookBehaviorTest(HttpTestBase):
 
     def test_broadcast_by_label(self):
         """带「公告」标签即可，不必同时有标题前缀。"""
-        ev = fixtures.issue_event(action="opened", actor="mayaoyao")
+        ev = fixtures.issue_event(action="opened", actor="carol")
         ev["issue"] = fixtures._issue(title="普通标题")
         ev["issue"]["assignees"] = []
         ev["issue"]["labels"] = [{"id": 9, "name": "公告"}]
@@ -605,7 +605,7 @@ class WebhookBehaviorTest(HttpTestBase):
 
     def test_non_author_announcement_is_not_broadcast(self):
         """非配置作者的 issue 即使带公告标题也不该全厅打扰。"""
-        ev = fixtures.issue_event(action="opened", actor="madeng")
+        ev = fixtures.issue_event(action="opened", actor="dave")
         ev["issue"] = fixtures._issue(title="【公告】标题")
         ev["issue"]["assignees"] = []
         self.post(ev, event="issues", delivery="bc3")
@@ -614,12 +614,12 @@ class WebhookBehaviorTest(HttpTestBase):
 
     def test_comment_is_not_broadcast(self):
         """只有 issue 新建/重开才广播；评论、请求评审都不该。"""
-        self.post(fixtures.issue_comment(body="@mayaoyao 看看"), delivery="bc4")
+        self.post(fixtures.issue_comment(body="@carol 看看"), delivery="bc4")
         subjects = [s for s, _ in self.relay.published]
         self.assertNotIn("evt.gitea.broadcast", subjects)
 
     def test_reopened_announcement_is_broadcast(self):
-        ev = fixtures.issue_event(action="reopened", actor="mayaoyao")
+        ev = fixtures.issue_event(action="reopened", actor="carol")
         ev["issue"] = fixtures._issue(title="【公告】重新上线")
         ev["issue"]["assignees"] = []
         self.post(ev, event="issues", delivery="bc5")
@@ -629,9 +629,9 @@ class WebhookBehaviorTest(HttpTestBase):
     def test_keep_alive_handles_multiple_valid_requests(self):
         """基线：keep-alive 本身能连续处理多个请求。"""
         results = self._pipelined([
-            self._signed_post(fixtures.issue_comment(body="@mayaoyao 一"), "ka1"),
-            self._signed_post(fixtures.issue_comment(body="@mayaoyao 二"), "ka2"),
-            self._signed_post(fixtures.issue_comment(body="@mayaoyao 三"), "ka3"),
+            self._signed_post(fixtures.issue_comment(body="@carol 一"), "ka1"),
+            self._signed_post(fixtures.issue_comment(body="@carol 二"), "ka2"),
+            self._signed_post(fixtures.issue_comment(body="@carol 三"), "ka3"),
         ])
         self.assertEqual([r[0] for r in results], [200, 200, 200])
 

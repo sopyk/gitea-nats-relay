@@ -37,7 +37,7 @@ def _issue(number=134, title="评审流水线的重试策略", pull=False):
         "html_url": f"https://gitea.example/org/repo/issues/{number}",
         "state": "open",
         "body": "讨论一下",
-        "assignees": [_user("mayaoyao")],
+        "assignees": [_user("carol")],
         "labels": [{"id": 1, "name": "bug"}],
         "user": _user("you"),
         "created_at": "2026-10-10T09:00:00Z",
@@ -53,7 +53,7 @@ def _issue(number=134, title="评审流水线的重试策略", pull=False):
     return obj
 
 
-def _pull_request(number=7, reviewers=("madeng",)):
+def _pull_request(number=7, reviewers=("dave",)):
     return {
         "id": 700,
         "number": number,
@@ -63,7 +63,7 @@ def _pull_request(number=7, reviewers=("madeng",)):
         "draft": False,
         "body": "描述",
         "labels": [{"id": 1, "name": "bug"}],
-        "assignees": [_user("mayaoyao")],
+        "assignees": [_user("carol")],
         "requested_reviewers": [_user(r) for r in reviewers],
         "user": _user("you"),
         "created_at": "2026-10-10T09:00:00Z",
@@ -72,7 +72,7 @@ def _pull_request(number=7, reviewers=("madeng",)):
 
 
 # ── IssueCommentPayload ────────────────────────────────────────
-def issue_comment(body="请 @mayaoyao 看一下，@madeng 帮忙确认",
+def issue_comment(body="请 @carol 看一下，@dave 帮忙确认",
                   issue=None, is_pull=False):
     p = {
         "action": "created",
@@ -98,7 +98,7 @@ def issue_comment(body="请 @mayaoyao 看一下，@madeng 帮忙确认",
 
 
 # ── IssuePayload（注意：没有 action_at / 没有时间戳顶层字段）──────
-def issue_event(action="opened", issue=None, actor="mayaoyao"):
+def issue_event(action="opened", issue=None, actor="carol"):
     return copy.deepcopy({
         "action": action,
         "number": (issue or _issue()).get("number", 134),
@@ -111,7 +111,7 @@ def issue_event(action="opened", issue=None, actor="mayaoyao"):
 
 # ── PullRequestPayload ─────────────────────────────────────────
 def pull_request_event(action="opened", pr=None, requested_reviewer=None,
-                       review=None, actor="mayaoyao"):
+                       review=None, actor="carol"):
     p = {
         "action": action,
         "number": (pr or _pull_request()).get("number", 7),
@@ -128,21 +128,21 @@ def pull_request_event(action="opened", pr=None, requested_reviewer=None,
 
 
 # ── 评审：ReviewPayload 是 {"type","content"}，没有 body / state ──
-def review_approved(content="整体没问题。@mayaoyao 可以合了"):
+def review_approved(content="整体没问题。@carol 可以合了"):
     return pull_request_event(
         action="reviewed",
         review={"type": "pull_request_review_approved", "content": content},
     )
 
 
-def review_rejected(content="这个重试逻辑有问题，@madeng 再看看"):
+def review_rejected(content="这个重试逻辑有问题，@dave 再看看"):
     return pull_request_event(
         action="reviewed",
         review={"type": "pull_request_review_rejected", "content": content},
     )
 
 
-def review_comment(content="这里建议改成 `@mayaoyao` 那样写"):
+def review_comment(content="这里建议改成 `@carol` 那样写"):
     return pull_request_event(
         action="reviewed",
         review={"type": "pull_request_review_comment", "content": content},
@@ -150,7 +150,7 @@ def review_comment(content="这里建议改成 `@mayaoyao` 那样写"):
 
 
 # ── 请求评审：requested_reviewer 在顶层且是单数 ─────────────────
-def review_requested(reviewer="madeng"):
+def review_requested(reviewer="dave"):
     return pull_request_event(
         action="review_requested",
         requested_reviewer=reviewer,

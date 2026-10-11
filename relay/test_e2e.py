@@ -412,7 +412,16 @@ def _read_server():
 
 
 def _payload(repo, actor, number, comment):
+    """造一条可控的 payload。
+
+    **必须清掉 fixture 的默认 assignee**：fixtures.issue_comment() 会带上一个
+    默认指派人，而它恰好在本文件的 MEMBERS 里，于是每个事件都会多发一条
+    门铃。这里第一版没清，断言一直是「subjects 里有 bob」这种包含式写法，
+    多一条少一条都发现不了 —— 直到把 fixture 里的占位名换成 members 里的
+    真实占位名（carol）才暴露出来。
+    """
     p = fixtures.issue_comment(body=comment)
+    p["issue"]["assignees"] = []
     p["repository"]["full_name"] = repo
     p["sender"]["login"] = actor
     p["issue"]["number"] = number
@@ -951,9 +960,14 @@ class RealNatsEndToEndTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(doc["status"], "accepted")
 
-        msgs = self.sub.drain(2.0)
-        self.assertTrue(msgs, "relay 回了 accepted，但订阅端一条都没收到")
-        subject, raw = msgs[0]
+        messages = self.sub.drain(2.0)
+        self.assertTrue(messages, "relay 回了 accepted，但订阅端一条都没收到")
+        # 精确断言：多一条也是错的。多出来的门铃意味着有人在没被叫到的情况下
+        # 收到了消息 —— 那比漏发更难解释。
+        self.assertEqual(len(messages), 1,
+                         f"应有且仅有 1 条，实际 {len(messages)}: "
+                         f"{[s for s, _ in messages]}")
+        subject, raw = messages[0]
         self.assertEqual(subject, "evt.gitea.notify.h1.alice",
                          f"订阅端收到的 subject 不对：{subject}")
         ev = json.loads(raw)

@@ -30,11 +30,49 @@ _ENV_ASSIGN = re.compile(r"^\s*#?\s*([A-Z][A-Z0-9_]*)\s*=")
 COMPOSE_RUN = os.path.join(ROOT, "docker-compose.yml")
 COMPOSE_BUILD = os.path.join(ROOT, "docker-compose.build.yml")
 README = os.path.join(ROOT, "README.md")
+DOCS_DIR = os.path.join(ROOT, "docs")
 SERVER = os.path.join(ROOT, "relay", "server.py")
 
 # README「消息格式」一节承诺的统一事件类型。改了这里等于改出站契约，
 # 所有已订阅的 Agent 都要跟着改 —— 必须是有意识的动作。
 DOCUMENTED_KINDS = {"issue", "issue_comment", "pull_request", "review"}
+
+
+def doc_files():
+    """所有承载文档的文件：README + docs/*.md（按文件名排序，结果稳定）。"""
+    files = [README]
+    if os.path.isdir(DOCS_DIR):
+        files += [os.path.join(DOCS_DIR, n) for n in sorted(os.listdir(DOCS_DIR))
+                  if n.endswith(".md")]
+    return files
+
+
+def all_docs():
+    """把全部文档拼成一份文本。
+
+    漂移检测扫的是**内容**而不是位置：契约表写在 README 还是 docs/reference
+    里，对「代码改了但文档没改」这件事没有任何区别。所以拆分文档之后，
+    这些断言不该跟着搬家 —— 它们该跟着内容走。
+    """
+    parts = []
+    for path in doc_files():
+        with open(path, encoding="utf-8") as f:
+            parts.append(f.read())
+    return "\n\n".join(parts)
+
+
+def locate(needle):
+    """在文档里找到 needle，返回 (文件名, 文件内行号)；找不到返回 (None, 0)。
+
+    报错时能指到具体文件，比只给一个「合并文本的行号」有用得多 ——
+    后者在任何一个文件里都对不上。
+    """
+    for path in doc_files():
+        with open(path, encoding="utf-8") as f:
+            for i, line in enumerate(f, 1):
+                if needle in line:
+                    return os.path.relpath(path, ROOT), i
+    return None, 0
 
 
 def strip_comments(text):
@@ -195,15 +233,53 @@ def parse_toml_sections(text):
     return sections
 
 
-def extract_readme_toml_block(anchor):
-    """取 README 里紧跟 anchor 的第一个 ```toml 代码块。"""
-    with open(README, encoding="utf-8") as f:
-        text = f.read()
-    i = text.index(anchor)
-    start = text.index("```toml", i)
-    start = text.index("\n", start) + 1
-    end = text.index("```", start)
-    return text[start:end]
+def extract_doc_toml_block(anchor):
+    """取所有文档里，紧跟 anchor 之后出现的第一个 ```toml 代码块。
+
+    跨文件找，而不是只看 README：内容搬到 docs/ 之后，这个函数不该失效。
+    找不到返回 None —— 之前用 text.index 抛异常，报的是「substring not found」，
+    完全看不出是「文档里没有这个示例」。
+    """
+    for path in doc_files():
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        if anchor not in text:
+            continue
+        i = text.index(anchor)
+        try:
+            start = text.index("```toml", i)
+        except ValueError:
+            continue
+        start = text.index("\n", start) + 1
+        end = text.index("```", start)
+        return text[start:end]
+    return None
+
+
+# 旧名保留：外部若有引用不至于断，但内部一律走 extract_doc_toml_block。
+extract_readme_toml_block = extract_doc_toml_block
+
+
+def _contract_section():
+    """HTTP 契约那一节的正文（跨文件找）。
+
+    原来只截 README 里 `## HTTP 契约` 到 `### 去重与重试语义` 之间。
+    契约表搬到 docs/reference.md 之后该跟着走 —— 它盯的是「代码改了、
+    契约表没改」，跟这段文字写在哪个文件里毫无关系。
+    """
+    start_markers = ("HTTP 契约",)
+    end_markers = ("去重与重试语义", "@提及解析")
+    for path in doc_files():
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        i = next((text.index(m) for m in start_markers if m in text), None)
+        if i is None:
+            continue
+        ends = [text.index(m) for m in end_markers if m in text and
+                text.index(m) > i]
+        end = min(ends) if ends else len(text)
+        return text[i:end]
+    raise AssertionError("所有文档里都找不到 HTTP 契约那一节")
 
 
 class ExampleConfigTest(unittest.TestCase):
@@ -272,24 +348,64 @@ class ExampleConfigTest(unittest.TestCase):
 
 
 class ReadmeConsistencyTest(unittest.TestCase):
-    """README 与实际产物的一致性。"""
+    """文档与实际产物的一致性（扫 README + docs/*.md）。"""
 
     def test_relative_links_resolve(self):
+        """README 和每一份 docs 里的相对链接都必须指向真实存在的文件。
+
+        docs/*.md 深了一层目录，链接要带 ../。拼错了不会渲染成死链而已 ——
+        GitHub 上照着文档操作的人会直接踩空，所以这条必须盯住。
+        """
+        broken = []
+        checked = 0
+        for path in doc_files():
+            base = os.path.dirname(path)          # 链接是相对**所在文件**解析的
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            targets = re.findall(r"\]\((?!https?:)([^)#]+)\)", text)
+            checked += len(targets)
+            for t in targets:
+                if not os.path.exists(os.path.normpath(os.path.join(base, t))):
+                    rel = os.path.relpath(path, ROOT)
+                    broken.append(f"{rel} → {t}")
+        self.assertTrue(checked, "所有文档里一个相对链接都没有，可疑")
+        self.assertEqual(broken, [], f"文档引用了不存在的文件: {broken}")
+
+    def test_readme_stays_a_readme(self):
+        """README 得是 README —— 长了没人读，等于没写。
+
+        不是行数洁癖：技术细节一旦堆回 README，它就退化成一份没人翻的
+        大文件，而 docs/ 里的内容会因为「README 里也有一份」而两边漂移。
+        上限留了余量，但仍足以挡住「把 docs 又粘回来了」。
+        """
+        with open(README, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertLess(len(lines), 260,
+                        f"README 已经 {len(lines)} 行，太长了；"
+                        f"技术细节该进 docs/，README 只留功能与上手")
+
+    def test_every_doc_is_linked_from_the_readme(self):
+        """docs/ 里每份文档都要能从 README 点进去。
+
+        否则它就成了「存在但没人找得到」的文件 —— 等于白写。
+        """
         with open(README, encoding="utf-8") as f:
             text = f.read()
-        targets = re.findall(r"\]\((?!https?:)([^)#]+)\)", text)
-        self.assertTrue(targets, "README 里一个相对链接都没有，可疑")
-        for t in targets:
-            self.assertTrue(os.path.exists(os.path.join(ROOT, t)),
-                            f"README 引用了不存在的文件: {t}")
+        for path in doc_files():
+            rel = os.path.relpath(path, ROOT)
+            if rel == "README.md":
+                continue
+            self.assertIn(f"({rel})", text,
+                          f"{rel} 没有被 README 引用，会没人找得到")
 
     def test_provider_block_matches_example_config(self):
-        """README 里的 provider 示例必须和 config/webhook2nats.example.toml 一致。
+        """文档里的 provider 示例必须和 config/webhook2nats.example.toml 一致。
 
-        这是最容易漂移的一处：改了模板忘了同步 README，读者就会照着
+        这是最容易漂移的一处：改了模板忘了同步文档，读者就会照着
         一个不存在的配置去部署。
         """
-        block = extract_readme_toml_block("## 通用模型")
+        block = extract_doc_toml_block("通用模型")
+        self.assertIsNotNone(block, "文档里找不到 provider 示例代码块")
         readme_secs = parse_toml_sections(block)
         with open(TOML_EXAMPLE, encoding="utf-8") as f:
             file_secs = parse_toml_sections(f.read())
@@ -298,28 +414,27 @@ class ReadmeConsistencyTest(unittest.TestCase):
                         "providers.gitea.signature",
                         "providers.gitea.events",
                         "providers.gitea.event_types"):
-            self.assertIn(section, readme_secs, f"README 示例缺 {section}")
+            self.assertIn(section, readme_secs, f"文档示例缺 {section}")
             self.assertIn(section, file_secs, f"示例配置缺 {section}")
             self.assertEqual(
                 readme_secs[section], file_secs[section],
-                f"section {section} 在 README 和示例配置之间不一致")
+                f"section {section} 在文档和示例配置之间不一致")
 
     def test_documented_kind_set_matches_example(self):
-        with open(README, encoding="utf-8") as f:
-            text = f.read()
+        text = all_docs()
         with open(TOML_EXAMPLE, "rb") as f:
             cfg = tomllib.load(f)
         used = set(cfg["providers"]["gitea"]["events"].values())
         used |= set(cfg["providers"]["gitea"]["event_types"].values())
-        # README 必须把用到的每个 kind 都写进那张表
+        # 文档必须把用到的每个 kind 都写进那张表
         for kind in used:
-            self.assertIn(f"`{kind}`", text, f"README 未文档化 kind {kind!r}")
+            self.assertIn(f"`{kind}`", text, f"文档未文档化 kind {kind!r}")
 
     def test_both_compose_files_are_documented(self):
-        with open(README, encoding="utf-8") as f:
-            text = f.read()
-        for f in ("docker-compose.yml", "docker-compose.build.yml"):
-            self.assertIn(f, text, f"README 没提到 {f}")
+        """两份 compose 都得被文档提到（README 或 docs 任一处都行）。"""
+        docs = all_docs()
+        for name in ("docker-compose.yml", "docker-compose.build.yml"):
+            self.assertIn(name, docs, f"文档里没提到 {name}")
 
 
 class ComposeTest(unittest.TestCase):
@@ -506,14 +621,14 @@ class EnvExampleTest(unittest.TestCase):
         self.assertGreaterEqual(len(found), 10, f"只扫到 {len(found)} 个: {found}")
 
     def test_config_file_var_is_documented(self):
-        """CONFIG_FILE 是新增的变量，README 与 relay.env.example 都该提到。"""
-        readme = open(README, encoding="utf-8").read()
+        """CONFIG_FILE 这个变量，文档与 relay.env.example 都该提到。"""
+        docs = all_docs()
         env_ex = open(ENV_EXAMPLE, encoding="utf-8").read()
-        self.assertIn("CONFIG_FILE", readme, "README 未文档化 CONFIG_FILE")
+        self.assertIn("CONFIG_FILE", docs, "文档未记录 CONFIG_FILE")
         self.assertIn("CONFIG_FILE", env_ex, "relay.env.example 未提及 CONFIG_FILE")
 
     def test_http_status_codes_match_implementation(self):
-        """README 的 HTTP 契约表必须覆盖 server.py 实际返回的每一个状态码。
+        """HTTP 契约表必须覆盖 server.py 实际返回的每一个状态码。
 
         手写状态码列表必然漂移 —— 之前就漏了 5 个（404 / 400 bad-length /
         413 / 400 missing-delivery / 200 ignored），而没有任何东西会发现。
@@ -522,15 +637,13 @@ class EnvExampleTest(unittest.TestCase):
             src = f.read()
         implemented = {int(c) for c, _ in re.findall(r'_reply\((\d+),\s*"([\w-]+)"', src)}
 
-        with open(README, encoding="utf-8") as f:
-            rd = f.read()
-        contract = rd[rd.index("## HTTP 契约"):rd.index("### 去重与重试语义")]
+        contract = _contract_section()
         documented = {int(c) for c in re.findall(r'`(\d{3})', contract)}
 
         self.assertTrue(documented, "契约表里一个状态码都没解析到")
         missing = implemented - documented
         self.assertEqual(missing, set(),
-                         f"server.py 返回了但 README 契约表没写: {sorted(missing)}")
+                         f"server.py 返回了但契约表没写: {sorted(missing)}")
 
     def test_every_reply_has_a_documented_body(self):
         """契约表里的每个 body 文案也要对得上，否则平台侧排查会摸不着头脑。"""
@@ -539,9 +652,7 @@ class EnvExampleTest(unittest.TestCase):
         bodies = _reply_bodies(src)
         self.assertIn("accepted", bodies, "没抓到响应体，扫描逻辑坏了")
 
-        with open(README, encoding="utf-8") as f:
-            rd = f.read()
-        contract = rd[rd.index("## HTTP 契约"):rd.index("### 去重与重试语义")]
+        contract = _contract_section()
         for body in bodies:
             self.assertIn(f"`{body}`", contract, f"响应体 {body!r} 未写进契约表")
 
