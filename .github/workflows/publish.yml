@@ -75,33 +75,30 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # QEMU 交叉构建偶尔会静默跳过某个架构（本地能验证的最好在这里也验证）
+      # QEMU 交叉构建偶尔会静默跳过某个架构，本地能验的就在 CI 里也验。
+      # 用 buildx 自带的 imagetools 读远端 manifest —— 它已经处理了
+      # token、Accept 头、多架构 index 这些细节，手写 curl 容易出错
+      # （前两版就栽在 tags 是 list 不是 dict、以及多行 JSON 被 YAML 折行上）。
       - name: Verify both architectures landed
         env:
-          TAGS_JSON: ${{ steps.meta.outputs.json }}
+          IMAGE: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
-          # 从 metadata-action 的 json 输出里取第一个 tag 的 digest
-          # metadata-action 的 json 输出里 tags 是 list[str]，不是 dict
-          image=$(echo "$TAGS_JSON" | python3 -c "
-          import json,sys
-          d=json.load(sys.stdin)
-          print(d['tags'][0])")
-          repo=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
-          token=$(curl -sSf \
-            "https://${REGISTRY}/token?scope=repository:${repo}:pull" \
-            | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
-          curl -sSf -H "Authorization: Bearer ${token}" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json' \
-            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://${REGISTRY}/v2/${repo}/manifests/${image}" > /tmp/m.json
-          python3 -c "
-          import json
-          d = json.load(open('/tmp/m.json'))
-          plats = sorted({m['platform']['os']+'/'+m['platform']['architecture']
-                          for m in d.get('manifests', []) if 'platform' in m})
-          print('manifest 平台:', plats)
-          missing = {'linux/amd64','linux/arm64'} - set(plats)
+          first="${IMAGE%%$'\n'*}"
+          echo "检查 $first"
+          docker buildx imagetools inspect "$first" --format '{{json .Manifest}}' > /tmp/m.json
+          python3 - <<'PY'
+          import json, sys
+          m = json.load(open("/tmp/m.json"))
+          # OCI image index 的结构是 manifests[].platform.{os,architecture}
+          plats = sorted({
+              f"{p.get('platform', {}).get('os')}/{p.get('platform', {}).get('architecture')}"
+              for p in m.get("manifests", [])
+              if p.get("platform", {}).get("architecture", "unknown") != "unknown"
+          })
+          print("manifest 平台:", plats)
+          missing = {"linux/amd64", "linux/arm64"} - set(plats)
           if missing:
-              sys.exit('缺少架构: %s —— QEMU 可能静默跳过了' % sorted(missing))
-          print('✓ 双架构确认')"
+              sys.exit("缺少架构 %s —— QEMU 可能静默跳过了" % sorted(missing))
+          print("✓ 双架构确认")
+          PY
