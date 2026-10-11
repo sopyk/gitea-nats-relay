@@ -107,7 +107,7 @@ class Config:
         return [p for p in self.providers.values() if p.enabled]
 
 
-def _reject_unknown(section_name, data, allowed, where):
+def _reject_unknown(data, allowed, where):
     """TOML 只校验语法不校验 schema —— 表名拼错会被当成一张无关的新表，
     配置静默失效。所以这里必须显式拦住未知键。"""
     unknown = set(data) - set(allowed)
@@ -166,14 +166,12 @@ def _apply_env(cfg, env):
 
 
 def _build_provider(name, raw, warn):
-    _reject_unknown(f"[providers.{name}]", raw, VALID_PROVIDER, f"[providers.{name}]")
+    _reject_unknown(raw, VALID_PROVIDER, f"[providers.{name}]")
 
     headers = raw.get("headers", {})
-    _reject_unknown(f"[providers.{name}.headers]", headers, VALID_HEADERS,
-                    f"[providers.{name}.headers]")
+    _reject_unknown(headers, VALID_HEADERS, f"[providers.{name}.headers]")
     sig_raw = raw.get("signature", {})
-    _reject_unknown(f"[providers.{name}.signature]", sig_raw, VALID_SIGNATURE,
-                    f"[providers.{name}.signature]")
+    _reject_unknown(sig_raw, VALID_SIGNATURE, f"[providers.{name}.signature]")
 
     p = ProviderConfig(
         name=name,
@@ -215,7 +213,16 @@ def _build_provider(name, raw, warn):
 
 
 def _defaults():
-    """没有任何配置文件时的兜底：与旧版本硬编码完全一致。"""
+    """没有任何配置文件时的兜底：与旧版本硬编码完全一致。
+
+    这里出现 gitea 字样是**有意的兼容层**，不是「provider 抽象没做完」：
+    NAS 上已有部署是纯环境变量配置、没有 config/webhook2nats.toml，
+    若默认 provider 为空，升级后服务会直接拒绝启动 —— 一次纯文档/重构
+    的升级就把线上打挂，这不可接受。
+
+    真正的新代码不该再往这里加东西：新平台通过配置文件声明。
+    test_internals.test_defaults_match_legacy_behaviour 锁住这个行为。
+    """
     cfg = Config()
     cfg.nats_servers = []
     cfg.providers["gitea"] = ProviderConfig(
@@ -314,10 +321,10 @@ def load(path=None, env=None, warn=None):
     cfg = _defaults() if not raw else Config()
 
     if raw:
-        _reject_unknown("配置文件根", raw, VALID_TOP_LEVEL, "配置文件根")
+        _reject_unknown(raw, VALID_TOP_LEVEL, "配置文件根")
 
         svc = raw.get("service", {})
-        _reject_unknown("[service]", svc, VALID_SERVICE, "[service]")
+        _reject_unknown(svc, VALID_SERVICE, "[service]")
         for k in ("listen", "client_name", "relay_id"):
             if k in svc:
                 if not isinstance(svc[k], str):
@@ -332,7 +339,7 @@ def load(path=None, env=None, warn=None):
                 float, 0)
 
         nat = raw.get("nats", {})
-        _reject_unknown("[nats]", nat, VALID_NATS, "[nats]")
+        _reject_unknown(nat, VALID_NATS, "[nats]")
         # 环境变量侧支持逗号分隔，文件侧也支持 —— 否则同一个语义两条路径
         # 实现不一致，写成 "a:4222,b:4222" 会得到一个字符串而不是数组。
         if "servers" in nat:
@@ -346,7 +353,7 @@ def load(path=None, env=None, warn=None):
                 setattr(cfg, f"nats_{k}", nat[k])
 
         rt = raw.get("routing", {})
-        _reject_unknown("[routing]", rt, VALID_ROUTING, "[routing]")
+        _reject_unknown(rt, VALID_ROUTING, "[routing]")
         for k in ("members_file", "notify_subject_prefix", "broadcast_subject"):
             if k in rt:
                 if not isinstance(rt[k], str):
@@ -357,7 +364,7 @@ def load(path=None, env=None, warn=None):
                 "routing", "broadcast_authors", rt["broadcast_authors"])
 
         dd = raw.get("dedup", {})
-        _reject_unknown("[dedup]", dd, VALID_DEDUP, "[dedup]")
+        _reject_unknown(dd, VALID_DEDUP, "[dedup]")
         if "file" in dd:
             if not isinstance(dd["file"], str):
                 raise ConfigError("[dedup] file 必须是字符串")

@@ -6,8 +6,10 @@ providers.py 和配置里。
 """
 import concurrent.futures
 import json
+import socket
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 def log_stack():
@@ -55,11 +57,20 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # 静默默认 access log
         pass
 
+    def _route(self):
+        """请求路径（去掉 query string）。
+
+        直接拿 self.path 匹配会让 `POST /gitea-hook?foo=1` 变成 404 ——
+        路径是按 provider 配的，本就该按 URL 的 path 部分匹配。
+        """
+        return urlsplit(self.path).path or "/"
+
     def do_GET(self):
-        if self.path == "/healthz":
+        if self._route() == "/healthz":
             ok = self.app.healthz()
             self._reply(200 if ok else 503, "ok" if ok else "nats-down")
         else:
+            self._drain()
             self._reply(404, "not-found")
 
     def _drain(self):
@@ -103,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
         return (self.rfile.read(length) if length else b""), None
 
     def do_POST(self):
-        provider = self.app.registry.get(self.path)
+        provider = self.app.registry.get(self._route())
         if provider is None:
             # 路径没匹配上，但请求体可能还在 socket 上 —— 不 drain 的话
             # keep-alive 下残余字节会被当成下一个请求行。
@@ -205,9 +216,24 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(app, listen):
+    """建 HTTP server。
+
+    app 通过动态子类绑定到 handler，而不是写成 Handler 的类属性 ——
+    类属性是**全局可变状态**，一个进程只能有一个 App，测试里想并行跑两个
+    实例就会互相串味。
+    """
     host, _, port = listen.rpartition(":")
-    Handler.app = app
-    httpd = ThreadingHTTPServer((host or "0.0.0.0", int(port)), Handler)
+    host = (host or "0.0.0.0").strip("[]")  # 去掉 IPv6 的方括号
+
+    bound = type("BoundHandler", (Handler,), {"app": app})
+
+    if ":" in host:  # IPv6 字面量
+        class V6Server(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+        httpd = V6Server((host, int(port)), bound)
+    else:
+        httpd = ThreadingHTTPServer((host, int(port)), bound)
+
     # 没有超时的 socket 会被「声明 Content-Length 然后不发数据」的客户端
     # 无限期占住一个线程。10s 足够读完一个几 MB 的 webhook。
     httpd.timeout = 10

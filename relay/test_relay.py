@@ -317,7 +317,7 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertEqual(body, b"publish-timeout")
         self.assertGreaterEqual(self.relay.cancelled, 1,
                                 "超时应尝试 cancel")
-        app = self.httpd.RequestHandlerClass.app
+        app = self.httpd.RequestHandlerClass.app  # serve() 绑定的子类
         self.assertNotIn("t1", app.seen.inflight)
         self.relay.hang = False
         self.assertEqual(self.post(p, delivery="t1"), (200, b"accepted"))
@@ -388,7 +388,7 @@ class WebhookBehaviorTest(HttpTestBase):
         p = fixtures.issue_comment(body="@mayaoyao 看看")
         self.relay.targets = [("h1", "mayaoyao")]
         self.assertEqual(self.post(p, delivery="persist")[0], 200)
-        app = self.httpd.RequestHandlerClass.app
+        app = self.httpd.RequestHandlerClass.app  # serve() 绑定的子类
         fresh = core.Seen(app.seen.path, app.seen.cap)
         self.assertEqual(fresh.begin("persist"), "seen")
 
@@ -400,7 +400,7 @@ class WebhookBehaviorTest(HttpTestBase):
         否则同一个 delivery 会被永久卡在 inflight，平台每次重试都只拿到
         一个误导性的 409 inflight，直到进程重启 —— 通知永久丢失。
         """
-        app = self.httpd.RequestHandlerClass.app
+        app = self.httpd.RequestHandlerClass.app  # serve() 绑定的子类
         broken = {"repository": "not-a-dict", "sender": {"login": "you"},
                   "issue": {"number": 1}}
         status, _ = self.post(broken, event="issues", delivery="LEAK")
@@ -413,7 +413,7 @@ class WebhookBehaviorTest(HttpTestBase):
 
     def test_unexpected_error_returns_500_not_reset(self):
         """未预期异常必须变成诚实的 500，而不是连接被重置（客户端零响应）。"""
-        app = self.httpd.RequestHandlerClass.app
+        app = self.httpd.RequestHandlerClass.app  # serve() 绑定的子类
         boom = lambda ev: (_ for _ in ()).throw(RuntimeError("boom"))
         app.registry["/gitea-hook"].normalizer = boom
         try:
@@ -426,7 +426,7 @@ class WebhookBehaviorTest(HttpTestBase):
 
     def test_non_dict_fields_do_not_crash_normalization(self):
         """平台改了 payload 结构不能变成永久丢事件。"""
-        app = self.httpd.RequestHandlerClass.app
+        app = self.httpd.RequestHandlerClass.app  # serve() 绑定的子类
         self.relay.targets = [("h1", "mayaoyao")]
         for i, payload in enumerate([
             {"repository": "str", "sender": "str", "issue": "str"},
@@ -466,7 +466,7 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertFalse(prov.verify(b"{}", {"X-Gitea-Signature": "ä"}))
 
     def test_bad_json_never_sticks_in_inflight(self):
-        app = self.httpd.RequestHandlerClass.app
+        app = self.httpd.RequestHandlerClass.app  # serve() 绑定的子类
         self.assertEqual(self.post(None, raw_body=b"{bad")[0], 400)
         self.assertEqual(app.seen.begin("bj"), "reserved")
 

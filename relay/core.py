@@ -106,7 +106,9 @@ def extract_targets(ev, members):
     logins.update(ev.get("mentions") or [])
     logins.update(ev.get("reviewers") or [])
     seen, targets = set(), []
-    for lg in logins:
+    # 排序：logins 是 set，直接遍历顺序不可复现 —— 同样的事件每次发出的
+    # subject 顺序可能不同，排查问题时对不上日志。排序后结果稳定。
+    for lg in sorted(logins):
         m = members.resolve(lg)
         if not m:
             continue

@@ -2,7 +2,7 @@
 """部署产物一致性测试（标准库；PyYAML 存在时追加 compose 结构校验）。
 
 这个项目最贵的失败模式不是代码挂掉，而是**文档、配置模板、实际代码互相漂移**：
-README 说 A、示例 TOML 写 B、server.py 读 C，���且没有任何报错。
+README 说 A、示例 TOML 写 B、代码读 C，而且没有任何报错。
 下面的用例把三者钉在一起。
 
 运行：python3 test_deploy.py

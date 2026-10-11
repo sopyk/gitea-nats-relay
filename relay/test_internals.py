@@ -84,8 +84,18 @@ class NormalizeTest(unittest.TestCase):
         self.assertRegex(ev["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
     def test_ts_absent_key_is_tolerated(self):
-        ev = self.norm(fixtures.issue_comment(), "issue_comment")
-        self.assertIsNotNone(ev["ts"])
+        """payload 里没有 action_at 时必须落到兜底时间，不能抛异常。"""
+        p = fixtures.issue_comment()
+        self.assertNotIn("action_at", p, "fixture 本就不该有这个键")
+        ev = self.norm(p, "issue_comment")
+        self.assertRegex(ev["ts"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$",
+                         "没有 action_at 时应回退到本地时钟")
+
+    def test_explicit_action_at_is_preserved(self):
+        """payload 真带了 action_at 就用它，不要覆盖。"""
+        p = fixtures.issue_comment()
+        p["action_at"] = "2026-01-02T03:04:05Z"
+        self.assertEqual(self.norm(p, "issue_comment")["ts"], "2026-01-02T03:04:05Z")
 
     def test_issue_comment_fields(self):
         ev = self.norm(fixtures.issue_comment(), "issue_comment")
@@ -353,7 +363,12 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(msgs, [])
 
     def test_defaults_match_legacy_behaviour(self):
-        """无配置文件时必须和旧代码行为一致，否则 NAS 上已有部署会挂。"""
+        """无配置文件时必须和旧代码行为一致，否则 NAS 上已有部署会挂。
+
+        _defaults() 里的 gitea 字样是**有意的兼容层**（纯 env 部署没有
+        TOML，默认 provider 为空会导致升级即拒绝启动）。这条用例锁住它，
+        同时也是「不该再加新东西进去」的提醒。
+        """
         cfg = config_mod.load(path="/nonexistent", env=dict(GITEA_ENV))
         self.assertEqual(cfg.providers["gitea"].path, "/gitea-hook")
         self.assertEqual(cfg.providers["gitea"].event_header, "X-Gitea-Event")
@@ -362,6 +377,16 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg.listen, "0.0.0.0:8090")
         self.assertEqual(cfg.publish_timeout_seconds, 3.0)
         self.assertEqual(cfg.notify_subject_prefix, "evt.gitea.notify")
+
+    def test_defaults_only_contain_legacy_events(self):
+        """兼容层里不该出现「只有新版才知道」的事件映射 ——
+        旧版 EVENT_MAP 只有 4 条，多出来的就意味着默认值和历史行为不一致了。"""
+        cfg = config_mod.load(path="/nonexistent", env=dict(GITEA_ENV))
+        g = cfg.providers["gitea"]
+        self.assertEqual(set(g.events),
+                         {"issues", "issue_comment", "pull_request"})
+        self.assertEqual(g.event_types, {},
+                         "旧版没有细头表；默认值里加了会让纯 env 部署行为突变")
 
 
 class MembersTest(unittest.TestCase):
@@ -624,11 +649,31 @@ class RoutingTest(unittest.TestCase):
             {"kind": "issue_comment", "action": "created", "actor": "mayaoyao",
              "title": "【公告】", "labels": []}, {"mayaoyao"}))
 
+    def test_targets_are_deterministic(self):
+        """排序后结果稳定 —— 同样的事件每次发出的 subject 顺序必须一致，
+        否则排查问题时对不上日志。"""
+        ev = {"assignees": ["zoe", "alice"], "mentions": ["madeng", "bob"]}
+        runs = {tuple(core.extract_targets(ev, self.members)) for _ in range(20)}
+        self.assertEqual(len(runs), 1, f"顺序不稳定: {runs}")
+
     def test_no_default_authors_in_code(self):
-        """代码里不得内置任何具体账号。"""
+        """代码里不得内置任何具体账号 —— 扫全部产品模块，不只是 core。"""
+        import glob
         import inspect
-        src = inspect.getsource(core)
-        self.assertNotIn("mayaoyao", src)
+        here = os.path.dirname(os.path.abspath(__file__))
+        offenders = []
+        for path in glob.glob(os.path.join(here, "*.py")):
+            base = os.path.basename(path)
+            if base.startswith("test_") or base == "fixtures.py":
+                continue
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            # 只看代码部分：docstring/注释里提到成员名不算
+            for line in src.splitlines():
+                code = line.split("#", 1)[0]
+                if any(n in code for n in ("mayaoyao", "madeng", "zhuazhua", "sopyk")):
+                    offenders.append(f"{base}: {line.strip()[:70]}")
+        self.assertEqual(offenders, [], f"产品代码里出现了具体登录名: {offenders}")
 
 
 class SeenTest(unittest.TestCase):

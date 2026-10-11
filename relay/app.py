@@ -10,6 +10,7 @@ import json
 import os
 import signal
 import sys
+import threading
 
 import nats
 
@@ -105,6 +106,26 @@ class Relay:
     def shutdown(self):
         self._shutdown = True
 
+    async def aclose(self):
+        """优雅关闭 NATS 连接。
+
+        只设 _shutdown 的话，NATS 那边看到的是硬断连：正在飞的 publish 被丢弃，
+        服务端的订阅者连接记录也来不及清理。drain() 会把缓冲里剩下的消息
+        发完再关 —— 这是 Core NATS 下唯一能保证「已确认的发布确实到达」的办法。
+        """
+        self._shutdown = True
+        if self.nc is None:
+            return
+        try:
+            await asyncio.wait_for(self.nc.drain(), timeout=5)
+            log("NATS drained")
+        except Exception as e:  # noqa
+            log("drain failed, closing anyway:", e)
+            try:
+                await self.nc.close()
+            except Exception:  # noqa
+                pass
+
 
 async def amain():
     try:
@@ -142,15 +163,11 @@ async def amain():
     stop = asyncio.Event()
 
     def _on_signal():
+        """信号处理器跑在事件循环线程里，所以不能阻塞地关 HTTP server。"""
         log("shutdown signal received")
         relay.shutdown()
-        stop.set()
-        # 放在事件循环线程之外，避免阻塞正在跑的 publish 协程
-        threading_shutdown()
-
-    import threading
-    def threading_shutdown():
         threading.Thread(target=httpd.shutdown, daemon=True).start()
+        stop.set()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -158,6 +175,11 @@ async def amain():
 
     await asyncio.get_running_loop().run_in_executor(None, httpd.serve_forever)
     await stop.wait()
+
+    # httpd.shutdown() 之后可能有 handler 线程还在收尾，等它们退出再关 NATS，
+    # 否则 drain 完连接又冒出新的发布。
+    httpd.server_close()
+    await relay.aclose()
     log("server stopped")
 
 
