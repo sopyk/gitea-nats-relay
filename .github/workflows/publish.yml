@@ -70,6 +70,10 @@ jobs:
           context: ./relay
           platforms: linux/amd64,linux/arm64
           push: true
+          # 让 /version 端点能报出真实 commit。刻意不读 .git：
+          # 交付镜像里没有它，多阶段构建里读了也只是无谓耦合。
+          build-args: |
+            GIT_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

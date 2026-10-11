@@ -7,6 +7,7 @@
 运行：python3 test_internals.py
 """
 import os
+import re
 import sys
 import tempfile
 import types
@@ -440,6 +441,160 @@ class MembersTest(unittest.TestCase):
                 "good": {"host": "h1", "id": "good"},
                 "bad": "oops",
             }}))
+
+
+class SubjectSafetyTest(unittest.TestCase):
+    """subject 前缀与公告 subject 的校验。
+
+    这两种配置一旦错了，现象是**投错人且全程无报错** —— 比起不来更难查，
+    所以必须在启动时就拦下。
+    """
+
+    BASE = ('[nats]\nservers = ["nats://x:4222"]\nuser = "u"\npassword = "p"\n'
+            '[providers.gitea]\npath = "/h"\n'
+            '[providers.gitea.headers]\nevent = "X-E"\n'
+            '[providers.gitea.signature]\nsecret = "s"\n'
+            '[providers.gitea.events]\nissues = "issue"\n')
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def load_routing(self, extra):
+        path = os.path.join(self.tmp, "r.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.BASE + extra)
+        return config_mod.load(path=path, env=dict(GITEA_ENV))
+
+    def test_wildcard_in_prefix_rejected(self):
+        """`*` 是 NATS 通配符，放进 subject 前缀等于订阅匹配而不是字面量。"""
+        for bad in ('notify_subject_prefix = "evt.gitea.*"',
+                    'notify_subject_prefix = "evt.gitea.notify>"'):
+            with self.assertRaises(config_mod.ConfigError) as cm:
+                self.load_routing(f"\n[routing]\n{bad}\n")
+            self.assertIn("通配符", str(cm.exception))
+
+    def test_wildcard_in_broadcast_rejected(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load_routing('\n[routing]\nbroadcast_subject = "evt.*"\n')
+
+    def test_broadcast_under_notify_prefix_rejected(self):
+        """全厅公告落在定向前缀之下，会被编进某个 Agent 的收件位。"""
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_routing(
+                '\n[routing]\nnotify_subject_prefix = "evt.gitea.notify"\n'
+                'broadcast_subject = "evt.gitea.notify.broadcast"\n')
+        self.assertIn("broadcast", str(cm.exception))
+
+    def test_distinct_subjects_accepted(self):
+        cfg = self.load_routing(
+            '\n[routing]\nnotify_subject_prefix = "evt.gitea.notify"\n'
+            'broadcast_subject = "evt.gitea.broadcast"\n')
+        self.assertEqual(cfg.broadcast_subject, "evt.gitea.broadcast")
+
+    def test_shared_prefix_without_dot_boundary_accepted(self):
+        """`evt.gitea.notifyX` 不算「落在前缀之下」—— 要的是 `.` 分界。
+
+        少这条的话，改个 topic 名（比如 notifyv2）就会被误判而启动失败。
+        """
+        cfg = self.load_routing(
+            '\n[routing]\nnotify_subject_prefix = "evt.gitea.notify"\n'
+            'broadcast_subject = "evt.gitea.notifyX"\n')
+        self.assertEqual(cfg.broadcast_subject, "evt.gitea.notifyX")
+
+
+class LogConfigTest(unittest.TestCase):
+    """[logging] 段的取值校验。环境变量会绕过 TOML 侧，必须在 validate 里兜住。"""
+
+    BASE = SubjectSafetyTest.BASE
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def load_logging(self, section, env=None):
+        path = os.path.join(self.tmp, "l.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.BASE + "\n" + section)
+        merged = dict(GITEA_ENV)
+        merged.update(env or {})
+        return config_mod.load(path=path, env=merged)
+
+    def test_defaults_when_section_absent(self):
+        """整段省略时也必须是能跑的默认值 —— 日志是附加能力。"""
+        cfg = self.load_logging("")
+        self.assertEqual(cfg.logging.level, "info")
+        self.assertEqual(cfg.logging.format, "text")
+        self.assertEqual(cfg.logging.file, "")
+        self.assertFalse(cfg.logging.log_bodies)
+
+    def test_bad_level_rejected(self):
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_logging('[logging]\nlevel = "verbose"\n')
+        self.assertIn("level", str(cm.exception))
+
+    def test_bad_format_rejected(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load_logging('[logging]\nformat = "xml"\n')
+
+    def test_log_bodies_defaults_false(self):
+        cfg = self.load_logging("[logging]\nlevel = \"debug\"\n")
+        self.assertFalse(cfg.logging.log_bodies)
+
+    def test_log_bodies_rejects_non_bool(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load_logging('[logging]\nlog_bodies = "yes"\n')
+
+    def test_backups_zero_allowed(self):
+        """backups=0 合法（只留当前文件），所以不能套「必须大于下界」那套。"""
+        cfg = self.load_logging("[logging]\nbackups = 0\n")
+        self.assertEqual(cfg.logging.backups, 0)
+
+    def test_backups_negative_rejected(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load_logging("[logging]\nbackups = -1\n")
+
+    def test_unknown_key_rejected(self):
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_logging('[logging]\nformt = "json"\n')
+        self.assertIn("formt", str(cm.exception))
+
+    def test_every_declared_key_is_actually_read(self):
+        """VALID_LOGGING 里不能留没人读的键。
+
+        这条是被 mutation 逼出来的：从 VALID_LOGGING 删掉 "log_bodies"
+        之后全套测试照样绿 —— 因为示例配置里那行是注释掉的，没有任何
+        测试真的去写一遍 [logging] 的每一个键。留着这样的键意味着
+        文档写了、校验放行了，实际却不生效。
+        """
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "config.py"), encoding="utf-8").read()
+        body = src[src.index("VALID_LOGGING = "):]
+        body = body[:body.index(")") + 1]
+        declared = set(re.findall(r'"([a-z_]+)"', body))
+        self.assertTrue(declared, "没解析出 VALID_LOGGING，扫描失效了")
+
+        # 只看**解析 [logging] 的那一段**。若搜全文，dataclass 的字段定义、
+        # env 覆盖等处也会出现同样的键名，删掉白名单里的一个照样能匹配上，
+        # 这条测试就成了永远绿的摆设（第一版就是这么写的，已被 mutation 抓到）。
+        parse_start = src.index('lg = raw.get("logging"')
+        parse_end = src.index('for name, praw in raw.get("providers"')
+        parse = src[parse_start:parse_end]
+        self.assertIn("_reject_unknown(lg, VALID_LOGGING", parse,
+                      "没找到 [logging] 的解析段，扫描失效了？")
+        for key in declared:
+            self.assertIn(
+                f'"{key}"', parse,
+                f"VALID_LOGGING 声明了 {key!r}，但解析代码里没有它 —— "
+                f"这个键会静默失效")
+
+    def test_env_bad_level_rejected(self):
+        """env 绕过 TOML 校验，必须由 validate 兜住 —— 否则会静默降级。"""
+        with self.assertRaises(config_mod.ConfigError):
+            self.load_logging("[logging]\n", env={"LOG_LEVEL": "verbose"})
+
+    def test_env_can_override(self):
+        cfg = self.load_logging("[logging]\nlevel = \"info\"\n",
+                                env={"LOG_LEVEL": "debug"})
+        self.assertEqual(cfg.logging.level, "debug")
 
 
 class ConfigTypeTest(unittest.TestCase):

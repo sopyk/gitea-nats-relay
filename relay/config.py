@@ -22,7 +22,8 @@ VALID_SIG_ALGOS = {"hmac-sha256": "sha256", "hmac-sha1": "sha1", "hmac-sha512": 
 
 DEFAULT_CONFIG_FILE = "/config/webhook2nats.toml"
 
-VALID_TOP_LEVEL = frozenset({"service", "nats", "routing", "dedup", "providers"})
+VALID_TOP_LEVEL = frozenset(
+    {"service", "nats", "routing", "dedup", "providers", "logging"})
 VALID_SERVICE = frozenset(
     {"listen", "client_name", "relay_id", "heartbeat_seconds", "publish_timeout_seconds"})
 VALID_NATS = frozenset({"servers", "user", "password"})
@@ -32,6 +33,11 @@ VALID_DEDUP = frozenset({"file", "capacity"})
 VALID_PROVIDER = frozenset({"enabled", "path", "headers", "signature", "events", "event_types"})
 VALID_HEADERS = frozenset({"event", "event_type", "delivery", "signature"})
 VALID_SIGNATURE = frozenset({"algorithm", "secret"})
+# 日志级别用 logging 模块的名字（INFO/DEBUG/…），校验时统一转大写比较。
+VALID_LOG_LEVELS = frozenset({"debug", "info", "warning", "error", "critical"})
+VALID_LOG_FORMATS = frozenset({"text", "json"})
+VALID_LOGGING = frozenset(
+    {"level", "format", "file", "max_bytes", "backups", "log_bodies"})
 
 # 能安全编进 NATS subject 的一段标识符。不允许 . * > （层级分隔符与通配符）、
 # 空格、以及任何非 ASCII —— 后者会让 subject 在不同客户端上产生歧义。
@@ -50,6 +56,26 @@ class Signature:
     @property
     def hash_name(self):
         return VALID_SIG_ALGOS.get(self.algorithm)
+
+
+@dataclass
+class LogConfig:
+    """日志配置。
+
+    默认值让**不配置也能正常工作** —— 纯 stdout、INFO、text、不记正文。
+    日志是附加能力，不该要求任何人先理解它才能起服务。字段默认值与
+    logs.LogConfig 保持一致，两边都留默认值是刻意的：config.py 不 import
+    logs.py，避免配置加载依赖日志模块（反了）。
+    """
+    level: str = "info"
+    format: str = "text"
+    file: str = ""
+    max_bytes: int = 5 * 1024 * 1024
+    backups: int = 5
+    # 唯一会记评论正文的开关。默认关。理由见 README：
+    # 「正文里有 @alice 但正则没抽到」这类解析 bug，两边的 mentions 都是空，
+    # 不看原文区分不出来。
+    log_bodies: bool = False
 
 
 @dataclass
@@ -100,6 +126,8 @@ class Config:
 
     dedup_file: str = "/data/seen.json"
     dedup_capacity: int = 2000
+
+    logging: LogConfig = field(default_factory=LogConfig)
 
     providers: dict = field(default_factory=dict)
 
@@ -162,6 +190,16 @@ def _apply_env(cfg, env):
         cfg.notify_subject_prefix = s("NOTIFY_SUBJECT_PREFIX")
     if s("BROADCAST_SUBJECT"):
         cfg.broadcast_subject = s("BROADCAST_SUBJECT")
+    if s("LOG_LEVEL"):
+        cfg.logging.level = s("LOG_LEVEL").lower()
+    if s("LOG_FORMAT"):
+        cfg.logging.format = s("LOG_FORMAT").lower()
+    if s("LOG_FILE"):
+        cfg.logging.file = s("LOG_FILE")
+    if s("LOG_MAX_BYTES"):
+        cfg.logging.max_bytes = int(s("LOG_MAX_BYTES"))
+    if s("LOG_BACKUPS"):
+        cfg.logging.backups = int(s("LOG_BACKUPS"))
     return cfg
 
 
@@ -392,6 +430,48 @@ def load(path=None, env=None, warn=None):
             cfg.dedup_capacity = _as_positive_number(
                 "dedup", "capacity", dd["capacity"], int, 0)
 
+        lg = raw.get("logging", {})
+        _reject_unknown(lg, VALID_LOGGING, "[logging]")
+        if "level" in lg:
+            if not isinstance(lg["level"], str):
+                raise ConfigError("[logging] level 必须是字符串")
+            level = lg["level"].strip().lower()
+            if level not in VALID_LOG_LEVELS:
+                raise ConfigError(
+                    f"[logging] level={level!r} 不支持；合法值: "
+                    f"{', '.join(sorted(VALID_LOG_LEVELS))}")
+            cfg.logging.level = level
+        if "format" in lg:
+            if not isinstance(lg["format"], str):
+                raise ConfigError("[logging] format 必须是字符串")
+            fmt = lg["format"].strip().lower()
+            if fmt not in VALID_LOG_FORMATS:
+                raise ConfigError(
+                    f"[logging] format={fmt!r} 不支持；合法值: "
+                    f"{', '.join(sorted(VALID_LOG_FORMATS))}")
+            cfg.logging.format = fmt
+        if "file" in lg:
+            if not isinstance(lg["file"], str):
+                raise ConfigError("[logging] file 必须是字符串")
+            cfg.logging.file = lg["file"]
+        if "max_bytes" in lg:
+            cfg.logging.max_bytes = _as_positive_number(
+                "logging", "max_bytes", lg["max_bytes"], int, 0)
+        if "backups" in lg:
+            # backups 允许 0（只留当前文件、不留历史），所以不能用
+            # _as_positive_number —— 那个要求严格大于下界。
+            b = lg["backups"]
+            if isinstance(b, bool) or not isinstance(b, int):
+                raise ConfigError(
+                    f"[logging] backups 必须是整数，实际是 {type(b).__name__}")
+            if b < 0:
+                raise ConfigError(f"[logging] backups 不能为负，实际是 {b}")
+            cfg.logging.backups = b
+        if "log_bodies" in lg:
+            if not isinstance(lg["log_bodies"], bool):
+                raise ConfigError("[logging] log_bodies 必须是 true / false")
+            cfg.logging.log_bodies = lg["log_bodies"]
+
         for name, praw in raw.get("providers", {}).items():
             cfg.providers[name] = _build_provider(name, praw, warn)
 
@@ -416,8 +496,59 @@ def validate(cfg):
             raise ConfigError(f"provider {p.name}: events 和 event_types 都是空的，收不到任何事件")
     if not cfg.enabled_providers():
         raise ConfigError("没有启用任何 provider")
+
+    # 环境变量绕过了 TOML 侧的取值校验（LOG_LEVEL=bogus 会直接落到这里），
+    # 而这个服务的失败模式是「静默跑错」而不是「起不来」，所以必须在这里
+    # 再拦一次 —— 宁可起不来，也不要带着错配置跑。
+    if cfg.logging.level not in VALID_LOG_LEVELS:
+        raise ConfigError(
+            f"LOG_LEVEL={cfg.logging.level!r} 不支持；合法值: "
+            f"{', '.join(sorted(VALID_LOG_LEVELS))}")
+    if cfg.logging.format not in VALID_LOG_FORMATS:
+        raise ConfigError(
+            f"LOG_FORMAT={cfg.logging.format!r} 不支持；合法值: "
+            f"{', '.join(sorted(VALID_LOG_FORMATS))}")
+    if cfg.logging.max_bytes <= 0:
+        raise ConfigError("LOG_MAX_BYTES 必须大于 0")
+    if cfg.logging.backups < 0:
+        raise ConfigError("LOG_BACKUPS 不能为负")
+
+    _validate_subjects(cfg)
+
     if missing:
         raise ConfigError("缺少必填配置: " + ", ".join(missing))
+
+
+def _validate_subjects(cfg):
+    """拦住会造成「投错人且不报错」的配置。
+
+    成员表里的 host/id 已经逐条校验过（见 load_members），但 subject 前缀和
+    公告 subject 此前**只校验存在、不校验内容**。这不是形式主义，下面两种
+    情况都会静默把门铃送错地方：
+
+    1. 含 NATS 通配符 `*` `>` —— 和成员表里已拦的点号是同一类问题
+    2. broadcast 落在 notify 前缀之下 —— 全厅公告会被编进某个 Agent 的
+       收件位（`evt.gitea.notify` + `.` + `broadcast`），定向门铃和
+       全厅公告混在一起，且**不会有任何报错**
+
+    刻意**不**加「至少 3 段」这类人为规则：段数多少不构成事故条件，
+    加了只会让合法配置平白起不来。反方向（notify 落在 broadcast 之下）
+    同样危险，但判定它需要结合 members 的实际取值，属于过度设计，不做。
+    """
+    prefix, broadcast = cfg.notify_subject_prefix, cfg.broadcast_subject
+    for field, value in (("notify_subject_prefix", prefix),
+                         ("broadcast_subject", broadcast)):
+        for ch, why in (("*", "订阅通配符"), (">", "订阅通配符")):
+            if ch in value:
+                raise ConfigError(
+                    f"routing.{field}={value!r} 含 NATS 通配符 {ch!r}（{why}）—— "
+                    f"它会被当成订阅匹配而不是字面量，投递语义将完全错乱")
+    if prefix and broadcast.startswith(prefix + "."):
+        raise ConfigError(
+            f"broadcast_subject={broadcast!r} 落在 notify_subject_prefix="
+            f"{prefix!r} 之下 —— 全厅公告会被编进某个 Agent 的收件位"
+            f"（如 {prefix}.{broadcast.rsplit('.', 1)[-1]}），"
+            f"且不会有任何报错。请把 broadcast 放到前缀之外。")
 
 
 def load_members(path):

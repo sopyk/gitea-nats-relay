@@ -25,6 +25,8 @@ except Exception:  # noqa
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOML_EXAMPLE = os.path.join(ROOT, "config", "webhook2nats.example.toml")
 ENV_EXAMPLE = os.path.join(ROOT, "relay.env.example")
+# 一行真正的环境变量赋值，可带前导 '#'（模板里未启用的项就是注释掉的示例）。
+_ENV_ASSIGN = re.compile(r"^\s*#?\s*([A-Z][A-Z0-9_]*)\s*=")
 COMPOSE_RUN = os.path.join(ROOT, "docker-compose.yml")
 COMPOSE_BUILD = os.path.join(ROOT, "docker-compose.build.yml")
 README = os.path.join(ROOT, "README.md")
@@ -461,12 +463,24 @@ class EnvExampleTest(unittest.TestCase):
         # 这里只要文件里出现过 "VAR=" 就算已记录。
         with open(ENV_EXAMPLE, encoding="utf-8") as f:
             raw = f.read()
-        documented = {l.lstrip("# ").split("=", 1)[0].strip()
-                      for l in raw.splitlines() if "=" in l}
+        # 只认真正的 VAR= 形状。早先用 `if "=" in l` 把散文中出现的等号也
+        # 当成赋值，于是「允许走全厅公告的作者登录名，逗号分隔。留空 = 不发
+        # 任何公告。」这类说明句会变成一个"变量名"，只能靠硬编码例外把它从
+        # 结果里减掉。正则要求变量名是大写环境变量形状，例外就不需要了。
+        documented = {m.group(1) for m in
+                      (_ENV_ASSIGN.match(line) for line in raw.splitlines())
+                      if m}
+        # 反向自检：正则没把真变量也滤掉，否则这条测试就成了空转的断言。
+        self.assertIn("WEBHOOK_SECRET", documented,
+                      "解析器没认出已存在的必填变量，ENV_ASSIGN 写错了？")
+        self.assertIn("CONFIG_FILE", documented)
 
         # 这几个由 compose 的 environment: 提供，值是容器内路径、没有环境相关性，
         # 放进 env 文件反而会让运维以为可以在那里改成宿主路径。
-        provided_elsewhere = {"MEMBERS_FILE", "DEDUP_FILE", "LISTEN"}
+        # WEBHOOK2NATS_VERSION 同理 —— 它由 Dockerfile 的 ARG 在构建期烤进
+        # 镜像，写进 relay.env 只会让人以为改了它就能换版本。
+        provided_elsewhere = {"MEMBERS_FILE", "DEDUP_FILE", "LISTEN",
+                              "WEBHOOK2NATS_VERSION"}
 
         missing = code_vars - documented - provided_elsewhere
         self.assertEqual(missing, set(),
@@ -474,8 +488,7 @@ class EnvExampleTest(unittest.TestCase):
 
         # 反过来：凡在 env 文件里出现的，必须真的是代码读到的变量，
         # 否则模板里会攒下已经废弃的变量名。
-        stale = documented - code_vars - {
-            "允许走全厅公告的作者登录名，逗号分隔。留空"}
+        stale = documented - code_vars
         self.assertEqual(stale, set(),
                          f"relay.env.example 里有代码不再读取的变量: {sorted(stale)}")
 

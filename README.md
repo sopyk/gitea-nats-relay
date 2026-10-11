@@ -35,10 +35,15 @@ Gitea / Forgejo 是**第一个接入方**，本文档以它作为完整示例；
 | 超时后**仍可能重复投递**（Core NATS 无 ack，窗口无法完全消除） | ⚠️ 见下 |
 | **TOML 配置加载 + 环境变量覆盖** | ✅ 可用 |
 | **启动配置校验**：未知键 / 非法 kind / 两表冲突告警 | ✅ 可用 |
-| `/healthz`、服务心跳、SIGTERM 优雅退出 | ✅ 可用 |
+| **结构化日志**：每请求一行，带 delivery / subject / 耗时；轮转有上限 | ✅ 可用 |
+| **日志隐私规则**：只记已投递给 Agent 的字段，不记正文与密钥 | ✅ 可用 |
+| **401 限流**（未认证请求刷不爆日志） | ✅ 可用 |
+| **subject 前缀校验**：通配符 / 公告与定向撞车，启动即报错 | ✅ 可用 |
+| `/healthz`、`/version`、服务心跳、SIGTERM 优雅退出 | ✅ 可用 |
 | 更多 provider（GitHub / GitLab） | ⏳ 下一平台 |
+| `/metrics`（Prometheus） | ⏳ 等真接了 Prometheus 再做 |
 
-进度与已知缺陷在 dev 分支的 PR 里跟踪。`relay/test_internals.py` 用**照着 Gitea 源码结构体造的 payload** 覆盖了上述每一项，`relay/test_relay.py` 走真实 socket 做端到端验证。
+进度与已知缺陷在 dev 分支的 PR 里跟踪。`relay/test_internals.py` 用**照着 Gitea 源码结构体造的 payload** 覆盖了上述每一项，`relay/test_relay.py` 走真实 socket 做端到端验证，`relay/test_logs.py` 钉住日志的降级、隐私与限流行为。
 
 ---
 
@@ -465,10 +470,18 @@ Gitea 的 payload 归一化（第六件的后半段）就是把 `repository` / `
 
 ## HTTP 契约
 
-- `GET /healthz` → NATS 连通返回 `200 ok`，否则 `503 nats-down`
+**所有响应都是 JSON**，`Content-Type: application/json; charset=utf-8`。
+
+- 成功（`2xx`）给 `status` 字段，失败给 `error` 字段。
+- 多数响应带 `delivery`（原样回显请求的 delivery 头）—— 平台侧可以直接拿它
+  和日志里的 `delivery=` 对上号。
+- 多数错误额外带 `hint`，说明**该改哪里的配置**，不用翻代码。
+
+- `GET /healthz` → NATS 连通返回 `200`（`status` 为 `ok`），否则 `503`（`error` 为 `nats-down`）
+- `GET /version` → `200`，`status` 为 `ok`，另返回 git commit SHA 与启动至今的秒数
 - `POST /gitea-hook`（Gitea webhook 配置的回调地址，路径由 provider 的 `path` 决定）：
 
-| 状态 | body | 含义 | 平台的下一步 |
+| 状态 | `status` / `error` | 含义 | 平台的下一步 |
 |---|---|---|---|
 | `200` | `accepted` | 所有相关 subject 已发布并 flush 成功 | 记为成功。**只有这时**才把 delivery 标记为已处理 |
 | `200` | `duplicate` | 这个 delivery 早先已成功处理过 | 记为成功，不再重试 |
@@ -483,6 +496,12 @@ Gitea 的 payload 归一化（第六件的后半段）就是把 `repository` / `
 | `500` | `publish-error` / `internal-error` | 未预期异常 | 视为失败 |
 | `502` | `publish-failed` | 某个 subject 发布失败 | **用同一个 UUID 重试** |
 | `504` | `publish-timeout` | 等待 NATS 确认超时 | **用同一个 UUID 重试** |
+
+例：
+
+```json
+{"error": "missing-delivery", "hint": "平台必须带 delivery 头，否则无法去重"}
+```
 
 **`502` / `504` / `500` 时 delivery 会回滚** —— 平台重试不会被当成重复丢弃。所有失败路径都保证释放 inflight 占位，所以平台重投总能被正常处理，不会永远卡在 `409`。
 
@@ -532,15 +551,138 @@ Docker 在**宿主机侧**读取 `relay.env` 并注入为环境变量——**这
 
 compose 默认带了 `cap_drop: ALL` 和 `no-new-privileges` —— 这台服务只需要「读请求体 + 出网连 NATS」，不需要任何特权；因为监听的是 8090 高位端口，去掉 `NET_BIND_SERVICE` 也能正常启动。
 
+## 日志
+
+排查门铃问题的第一现场。默认每请求一行：
+
+```
+ts=2026-10-11T13:38:57.412+08:00 lvl=INFO provider=gitea delivery=b1f4c9e2…
+repo=acme/webhook2nats number=134 kind=issue_comment actor=zhangsan
+mentions=[alice wuming] subjects=[evt.gitea.notify.h1.alice]
+status=200 decision=accepted dur_ms=1.2 peer=10.0.0.9 msg="请求处理完成"
+```
+
+### 按 delivery 把日志和门铃对上号
+
+Agent 收到的 NATS 消息里也有同一个 `delivery`。想确认「这条门铃到底发到哪了」，直接：
+
+```bash
+docker logs webhook2nats 2>&1 | grep 'delivery=b1f4c9e2'
+```
+
+### 会记什么、不会记什么
+
+> **只记「已经发给 Agent 的字段」。**
+
+`repo` / `number` / `actor` / `mentions` / `subjects` / `delivery` 这些本来就在
+NATS 消息里 —— Agent 已经持有了，日志再记一遍**不增加任何暴露面**。
+
+**不进日志**：`comment.body`、签名头、任何 secret。
+这三样被格式化层硬性拦掉（`logs.py` 的 `_FORBIDDEN_FIELDS`），不依赖调用方自觉。
+
+`[logging] log_bodies = true` 可以在排查解析 bug 时临时放行正文 —— 那是唯一一处例外。
+
+### 怎么用它定位「门铃没响」
+
+典型现场：某人被 @ 了但没收到门铃。日志里看这两行的差异就够了：
+
+```
+mentions=[alice wuming] subjects=[evt.gitea.notify.h1.alice]
+```
+
+`mentions` 里有 `wuming`，但 `subjects` 里没有他 —— **`wuming` 不在 `members.json` 里**。
+正文记不记都无所谓，元数据已经给出答案。
+
+### 输出与轮转
+
+| 去处 | 上限 | 怎么改 |
+|---|---|---|
+| stdout（`docker logs`） | 10MB × 3 | compose 里的 `logging.max-size` / `max-file` |
+| `/data/logs/relay.log` | 5MB × 5 | `[logging] max_bytes` / `backups`，或留空 `file` 不写文件 |
+
+两边都是有界的，不会无限长。
+
+**日志文件建不出来时不会让服务起不来** —— 自动降级成只写 stdout 并打一条
+警告。比如 `/data` 被改成只读挂载时，relay 照常工作，只是没有文件日志。
+
+### 401 为什么是 WARNING 而不是 ERROR
+
+401 是**未认证**请求 —— 任何能连到 8090 的人都能零成本刷。每一刀都记明细
+等于给对方一个日志写放大器：填满 5MB 轮转文件，把真正的投递记录挤出去，
+攻击者反而达成目的。
+
+所以 401 走限流：**每分钟前 5 条记明细，之后聚合成一行计数**。
+保留了「有人在撞门」的检测信号，又不让它无上限占磁盘。
+
+### 排查正则解析 bug
+
+有一种情况元数据救不了：正文里明明有 `@alice`，但正则没抽到。这时
+Agent 消息里 `mentions` 是空的，日志里也是空的 —— 两边一样，
+分不清是「没提到」还是「提到了没认出来」。
+
+这时把 `[logging] log_bodies` 临时改成 `true`，重启，抓一次，然后关回去。
+
+### JSON 格式
+
+给 log shipper 用：
+
+```toml
+[logging]
+format = "json"
+```
+
+### 不做 `/metrics`
+
+目前没有 Prometheus，`requests_total` 这种数字用日志 grep 就够。
+将来真要接，名字锁定为：
+
+```
+webhook2nats_requests_total{status}
+webhook2nats_publish_duration_seconds
+webhook2nats_publish_failures_total{subject}
+webhook2nats_deliveries_seen_total
+```
+
+名字只是先定下来，**日志行不为了对齐 Prometheus 语法** ——
+`status=200` 和 `status="200"` 一样好 grep，没必要为此牺牲可读性。
+
+## 验收时容易踩的两个坑
+
+这两条都让 relay 看起来「坏了」，其实不是。
+
+### 一、Core NATS 不留存消息 —— 订阅者必须先在线
+
+**Core NATS 不留存**。事件发布的那一刻没人在听，消息就永久消散了。
+
+所以验收脚本的正确顺序是：**先起订阅 → 确认在线 → 再回帖触发**。
+反过来做（先发事件、再连订阅）必然收不到，而且 relay 会回 `accepted`
+—— 因为它**确实**成功发布了，只是当时没人在听。
+
+日志能证明这一点：看到 `subjects=[...] decision=accepted` 就说明
+relay 侧完全正常，问题在订阅时机。
+
+### 二、订阅 `evt.>`，不是 `evt.gitea.notify.>`
+
+两个默认 subject 不在同一个命名空间下：
+
+| 用途 | 默认值 |
+|---|---|
+| 定向门铃 | `evt.gitea.notify.<host>.<id>` |
+| 全厅公告 | `evt.gitea.broadcast` |
+
+订阅 `evt.gitea.notify.>` **收不到全厅公告，而且不会有任何报错**。
+要覆盖两者请订阅 `evt.>`。
+
 ## 测试
 
-三套测试，都不需要真实 NATS 或外网：
+四套测试，都不需要真实 NATS 或外网：
 
 ```bash
 python3 test_deploy.py            # 部署产物：README↔配置模板↔compose 是否漂移
 cd relay
 python3 test_internals.py         # 配置加载/校验、provider、归一化、@提及、去重、路由
 python3 test_relay.py             # HTTP 端到端：真 socket、真 HMAC，只有 NATS 是假的
+python3 test_logs.py              # 日志：降级、隐私、限流、轮转、结构性护栏
 ```
 
 **`relay/fixtures.py` 里的 payload 严格对照 Gitea `modules/structs/hook.go` 的结构体造**，不是凭印象编的 —— 正是那几个结构体里藏着本项目踩过的坑（payload 没有 `action_at`、`ReviewPayload` 用 `content` 而非 `body`、`requested_reviewer` 是顶层单数字段）。
@@ -548,6 +690,20 @@ python3 test_relay.py             # HTTP 端到端：真 socket、真 HMAC，只
 覆盖：HMAC 拒绝与篡改检测、代码块/邮箱/路径不误触、中文紧邻字符 @提及、成员映射路由与坏数据拒绝、公告判定、delivery 去重往返与重启保持、缺 delivery 头拒绝、失败回滚后同 UUID 可重试、inflight 冲突、双事件头映射与优先级、评审三事件、请求评审与推 commit 的区分、body 上限与 Content-Length 防护、端到端 webhook 处理。
 
 `test_deploy.py` 专门盯**文档与产物漂移** —— README 里的 provider 示例与 `config/webhook2nats.example.toml` 不一致、两份 compose 除了镜像来源之外不一致、README 链接指向不存在的文件，这些都会被它挡住。
+
+`test_logs.py` 里每一条都在钉一个**具体的失败模式**，不是凑覆盖率：
+
+| 测试 | 钉住的事 |
+|---|---|
+| 日志目录不可写 | 服务照常起来，**不能因为日志配置而启动失败** |
+| 轮转上限 | 写 500 行之后总大小仍有界 ——「不要无限存」得真的成立 |
+| 隐私过滤 | `body` / `secret` / `password` 不出现在任何日志里 |
+| 401 级别与限流 | 未认证请求刷不爆日志；且**限流本身被接线到了 401 路径上** |
+| AST 护栏 | 每个 `return` 之前都有 `_reply` —— 日志不会漏掉某个分支 |
+| 反向自检 | 把上面某条破坏掉，测试**必须失败** —— 防止护栏本身是假的 |
+
+最后一条是这套测试的关键：护栏测试自己也可能是摆设。所以每条结构
+性断言都配了一条「故意破坏 → 必须报错」的反向自检。
 
 ## 目录结构
 
@@ -557,10 +713,12 @@ relay/
   config.py         # 配置加载（env > TOML > 默认）+ 启动校验 + 成员映射校验
   providers.py      # provider 注册表 + @提及抽取 + Gitea payload 归一化
   core.py           # 去重 / 收件人解析 / 公告判定（与平台无关）
+  logs.py           # 日志：格式化 / 滚动 / 降级 / 限流 / 隐私过滤
   server.py         # HTTP 接收层（不认识任何具体平台）
   fixtures.py       # 真实 Gitea payload fixture
   test_internals.py # 单元测试
   test_relay.py     # HTTP 端到端测试
+  test_logs.py      # 日志的降级/隐私/限流护栏
   Dockerfile
 config/
   webhook2nats.example.toml   # 配置模板（无环境值，可进库）
