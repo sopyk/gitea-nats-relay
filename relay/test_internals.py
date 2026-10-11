@@ -453,6 +453,12 @@ class ConfigTypeTest(unittest.TestCase):
                      '[providers.gitea.signature]\nsecret = "s"\n'
                      '[providers.gitea.events]\nissues = "issue"\n')
 
+    def load_full(self, text, env=None):
+        path = os.path.join(self.tmp, "full.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return config_mod.load(path=path, env=dict(GITEA_ENV) if env is None else env)
+
     def load_with(self, extra, env=None):
         path = os.path.join(self.tmp, "c.toml")
         with open(path, "w", encoding="utf-8") as f:
@@ -521,6 +527,103 @@ class ConfigTypeTest(unittest.TestCase):
     def test_dedup_capacity_zero_rejected(self):
         with self.assertRaises(config_mod.ConfigError):
             self.load_with('\n[dedup]\ncapacity = 0\n')
+
+    def test_enabled_must_be_boolean(self):
+        """TOML 里 enabled = "false" 是 truthy 字符串，会让本该禁用的
+        provider 保持启用 —— 静默接收它不该收的事件。"""
+        toml = self.base.replace("[providers.gitea]\n",
+                                 '[providers.gitea]\nenabled = "false"\n')
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_full(toml)
+        self.assertIn("enabled", str(cm.exception))
+
+    def test_secret_must_be_string(self):
+        """secret 写成数字必须被拒绝 —— 否则每次验签都失败。"""
+        toml = self.base.replace('secret = "s"', "secret = 123")
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_full(toml)
+        self.assertIn("secret", str(cm.exception))
+
+    def test_signature_algorithm_must_be_string(self):
+        toml = self.base.replace('[providers.gitea.signature]\n',
+                                 '[providers.gitea.signature]\nalgorithm = 123\n')
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_full(toml)
+        self.assertIn("algorithm", str(cm.exception))
+
+    def test_event_types_value_must_be_known_kind(self):
+        toml = self.base.replace('[providers.gitea.events]\nissues = "issue"\n',
+                                 '[providers.gitea.events]\nissues = "issue"\n'
+                                 '[providers.gitea.event_types]\nfoo = "abc"\n')
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_full(toml)
+        self.assertIn("未文档化的 kind", str(cm.exception))
+
+
+class MalformedPayloadTest(unittest.TestCase):
+    """payload 字段类型错时必须降级处理，不能抛异常。
+
+    抛异常 = 500 = 平台用同一个 payload 无限重试，而这条通知永远发不出去。
+    """
+
+    def setUp(self):
+        self.p, _ = gitea_provider()
+
+    def norm(self, payload, kind="issue_comment"):
+        return self.p.normalize(payload, kind, payload.get("action", ""))
+
+    def test_wrong_scalar_types_do_not_crash(self):
+        cases = {
+            "labels 是数字": {"issue": {"number": 1, "labels": 5}},
+            "labels 是字符串": {"issue": {"number": 1, "labels": "bug"}},
+            "labels 元素是字符串": {"issue": {"number": 1, "labels": ["a", {"name": "b"}]}},
+            "title 是数字": {"issue": {"number": 1, "title": 123}},
+            "title 是 None": {"issue": {"number": 1, "title": None}},
+            "title 是列表": {"issue": {"number": 1, "title": [1, 2]}},
+            "comment.body 是数字": {"issue": {"number": 1},
+                                    "comment": {"body": 123, "html_url": "u"}},
+            "comment.body 是对象": {"issue": {"number": 1},
+                                    "comment": {"body": {"a": 1}}},
+            "comment.body 是列表": {"issue": {"number": 1},
+                                    "comment": {"body": ["@bob"]}},
+            "mentions.login 是数字": {"issue": {"number": 1},
+                                      "comment": {"body": "", "mentions": [{"login": 123}]}},
+            "state 是列表": {"issue": {"number": 1, "state": [1]}},
+            "assignees 是数字": {"issue": {"number": 1, "assignees": 5}},
+            "html_url 是数字": {"issue": {"number": 1, "html_url": 42}},
+            "review.content 是数字": {"review": {"type": "x", "content": 5}},
+            "review 是字符串": {"review": "not-a-dict"},
+            "requested_reviewer 是字符串": {"requested_reviewer": "bob"},
+            "repo.full_name 是数字": {"repository": {"full_name": 7}},
+            "sender.login 是列表": {"sender": {"login": ["a"]}},
+            "action 是数字": {"issue": {"number": 1}},
+        }
+        for name, payload in cases.items():
+            with self.subTest(name):
+                ev = self.norm(dict(payload))
+                self.assertIn("kind", ev)
+
+    def test_wrong_types_yield_sane_values(self):
+        ev = self.norm({"issue": {"number": 1, "title": 123, "labels": 5,
+                                  "assignees": "not-a-list", "html_url": 42}})
+        self.assertEqual(ev["title"], "123")
+        self.assertEqual(ev["labels"], [])
+        self.assertEqual(ev["assignees"], [])
+        self.assertEqual(ev["url"], "42")
+
+    def test_none_becomes_empty_not_string_none(self):
+        """None 必须变成空串而不是 "None" —— 后者会出现在展示界面上。"""
+        ev = self.norm({"issue": {"number": 1, "title": None, "html_url": None},
+                        "repository": {"full_name": None},
+                        "sender": {"login": None}})
+        self.assertEqual(ev["title"], "")
+        self.assertEqual(ev["url"], "")
+        self.assertEqual(ev["repo"], "")
+        self.assertEqual(ev["actor"], "")
+
+    def test_extract_mentions_tolerates_non_string(self):
+        self.assertEqual(self.p.normalizer.__globals__["extract_mentions"](123), [])
+        self.assertEqual(self.p.normalizer.__globals__["extract_mentions"](None), [])
 
 
 class MembersSubjectSafetyTest(unittest.TestCase):

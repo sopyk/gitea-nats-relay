@@ -26,6 +26,10 @@ MAX_BODY_BYTES = 1 * 1024 * 1024
 # 不为一个注定失败的请求花掉读大 body 的时间。
 DRAIN_LIMIT = 64 * 1024
 
+# 单个连接的最长存活时间。读一个几 MB 的 webhook 10 秒绰绰有余；
+# 超时的连接会被 close，线程随之释放。
+REQUEST_TIMEOUT_SECONDS = 10
+
 
 class App:
     """把配置、provider、核心串起来。测试可以注入假的 publish。"""
@@ -236,7 +240,14 @@ def serve(app, listen):
     host, _, port = listen.rpartition(":")
     host = (host or "0.0.0.0").strip("[]")  # 去掉 IPv6 的方括号
 
-    bound = type("BoundHandler", (Handler,), {"app": app})
+    bound = type("BoundHandler", (Handler,), {
+        "app": app,
+        # per-connection 超时。BaseHTTPRequestHandler 默认是 None（永不超时），
+        # 一个「声明 Content-Length 然后不发数据」的未认证客户端就能永久
+        # 占住一个线程 —— ThreadingHTTPServer 不限线程数，等于自己把自己打死。
+        # 注意 httpd.timeout 管的是 accept()，对这里没用（那是另一回事）。
+        "timeout": REQUEST_TIMEOUT_SECONDS,
+    })
 
     if ":" in host:  # IPv6 字面量
         class V6Server(ThreadingHTTPServer):
@@ -245,8 +256,5 @@ def serve(app, listen):
     else:
         httpd = ThreadingHTTPServer((host, int(port)), bound)
 
-    # 没有超时的 socket 会被「声明 Content-Length 然后不发数据」的客户端
-    # 无限期占住一个线程。10s 足够读完一个几 MB 的 webhook。
-    httpd.timeout = 10
     httpd.daemon_threads = True
     return httpd

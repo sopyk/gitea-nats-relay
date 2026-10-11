@@ -518,6 +518,18 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertEqual(status, 401, "非 ASCII 签名头应被干净地拒绝为 401")
         self.assertEqual(resp, b"bad-signature")
 
+    def test_socket_timeout_is_configured(self):
+        """per-connection 超时必须真的设上。
+
+        BaseHTTPRequestHandler.timeout 默认是 None（永不超时），
+        一个「声明 Content-Length 然后不发数据」的未认证客户端就能
+        永久占住一个线程 —— ThreadingHTTPServer 不限线程数。
+        """
+        cls = self.httpd.RequestHandlerClass
+        self.assertIsNotNone(cls.timeout,
+                             "Handler.timeout 没设，慢连接可无限占线程")
+        self.assertLessEqual(cls.timeout, 30)
+
     def test_verify_rejects_non_ascii_directly(self):
         cfg = config_mod.load(path="/nonexistent", env={
             "NATS_SERVERS": "nats://h:4222", "NATS_USER": "u",

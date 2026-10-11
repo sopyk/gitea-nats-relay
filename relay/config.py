@@ -172,10 +172,29 @@ def _build_provider(name, raw, warn):
     _reject_unknown(headers, VALID_HEADERS, f"[providers.{name}.headers]")
     sig_raw = raw.get("signature", {})
     _reject_unknown(sig_raw, VALID_SIGNATURE, f"[providers.{name}.signature]")
+    for k in ("algorithm", "secret"):
+        if k in sig_raw and not isinstance(sig_raw[k], str):
+            # secret 写成数字能通过校验的话，之后每次验签都会失败
+            raise ConfigError(
+                f"[providers.{name}.signature] {k} 必须是字符串，实际是 "
+                f"{type(sig_raw[k]).__name__}")
 
+    for k in ("events", "event_types"):
+        table = raw.get(k, {})
+        if not isinstance(table, dict):
+            raise ConfigError(
+                f"[providers.{name}.{k}] 必须是表（[key] = \"kind\"），实际是 "
+                f"{type(table).__name__} —— 例如写成 issues = \"issue\"")
+
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        # TOML 里 enabled = "false" 是字符串，truthy，会让 provider 意外保持启用
+        raise ConfigError(
+            f"[providers.{name}] enabled 必须是布尔值 true/false，"
+            f"实际是 {enabled!r} —— 注意 TOML 里不要给 true/false 加引号")
     p = ProviderConfig(
         name=name,
-        enabled=raw.get("enabled", True),
+        enabled=enabled,
         path=raw.get("path", "/"),
         event_header=headers.get("event", "X-Event"),
         # 细头是可选的：GitHub 这类只有一个事件头的平台不声明即可，

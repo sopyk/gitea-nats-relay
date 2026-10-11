@@ -133,6 +133,12 @@ async def amain():
     except config_mod.ConfigError as e:
         log("ERROR:", e)
         sys.exit(1)
+    except Exception as e:  # noqa
+        # 配置层的 bug（比如某个字段类型没覆盖到）会以 ValueError/TypeError 冒出来。
+        # 那时至少要打印得比裸 traceback 清楚 —— 运维只关心「哪项配置不对」。
+        log("ERROR: 加载配置时发生未预期的异常：", type(e).__name__, e)
+        log("请检查配置文件与 server.py:config_mod.load 的类型覆盖是否一致")
+        sys.exit(1)
     for w in getattr(cfg, "warnings", []):
         log("WARN:", w)
     if not cfg.broadcast_authors:

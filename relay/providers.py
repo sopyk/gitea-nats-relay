@@ -35,7 +35,7 @@ MAX_TITLE_CHARS = 140
 
 def extract_mentions(text):
     """剥离代码块/行内码后抽取 @登录名（代码里的 @ 不触发通知）。"""
-    if not text:
+    if not text or not isinstance(text, str):
         return []
     text = _CODE_FENCE_RE.sub(" ", text)
     text = _INLINE_CODE_RE.sub(" ", text)
@@ -96,6 +96,25 @@ def _login_list(users):
     return [u.get("login") for u in users if isinstance(u, dict) and u.get("login")]
 
 
+def _text(value, limit=None):
+    """任何东西都能安全当字符串用。
+
+    payload 是平台给的，不能假设字段类型符合文档 —— `title` 是数字、
+    `comment.body` 是对象都真实发生过。直接用 str() 会在 None 上得到
+    "None" 这种脏值，所以 None 单独处理。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value[:limit] if limit else value
+    return str(value)[:limit] if limit else str(value)
+
+
+def _iter(value):
+    """非 list 一律当作空 —— labels/assignees 给成数字或字符串时不该崩。"""
+    return value if isinstance(value, list) else []
+
+
 def _obj(value):
     """只把 dict 当对象用。
 
@@ -137,43 +156,43 @@ def normalize_gitea(payload, kind, action):
 
     ev = {
         "kind": kind,
-        "action": action,
-        "repo": repo.get("full_name") or "",
-        "actor": sender.get("login") or "",
+        "action": _text(action),
+        "repo": _text(repo.get("full_name")),
+        "actor": _text(sender.get("login")),
         # Gitea 的 webhook payload 里根本没有时间字段（旧代码读一个不存在的
         # action_at，永远拿到空串）。这里退回到本地时钟 —— 至少让下游能排序。
-        "ts": payload.get("action_at") or _now_iso(),
+        "ts": _text(payload.get("action_at")) or _now_iso(),
     }
 
     if obj:
         ev["number"] = obj.get("number")
-        ev["title"] = (obj.get("title") or "")[:MAX_TITLE_CHARS]
-        ev["url"] = obj.get("html_url") or ""
-        ev["state"] = obj.get("state")
+        ev["title"] = _text(obj.get("title"), MAX_TITLE_CHARS)
+        ev["url"] = _text(obj.get("html_url"))
+        ev["state"] = _text(obj.get("state"))
         ev["assignees"] = _login_list(obj.get("assignees"))
         if is_pr or kind in ("pull_request", "review"):
             ev["is_pr"] = True
-        ev["labels"] = [l.get("name") for l in (obj.get("labels") or [])
+        ev["labels"] = [l.get("name") for l in _iter(obj.get("labels"))
                         if isinstance(l, dict) and l.get("name")]
 
     c = _obj(payload.get("comment"))
     if c:
-        ev["comment_url"] = c.get("html_url") or ""
+        ev["comment_url"] = _text(c.get("html_url"))
         # Gitea 的 Comment 结构体**没有** mentions 字段（API 里有，webhook 里没有），
         # 所以提及只能靠正文正则抽。留着一行兼容将来可能的字段。
         api = _login_list(c.get("mentions"))
-        ev["mentions"] = sorted(set(api) | set(extract_mentions(c.get("body") or "")))
+        ev["mentions"] = sorted(set(api) | set(extract_mentions(_text(c.get("body")))))
 
     rev = _obj(payload.get("review"))
     if rev:
         # Gitea 的 ReviewPayload 是 {"type": ..., "content": ...}，
         # 读 body 会永远拿到 None，评审正文里的 @提及 100% 丢失。
-        ev["review_state"] = rev.get("type") or rev.get("state")
+        ev["review_state"] = _text(rev.get("type") or rev.get("state"))
         api = _login_list(rev.get("mentions"))
-        ev["mentions"] = sorted(set(api) | set(extract_mentions(rev.get("content") or "")))
+        ev["mentions"] = sorted(set(api) | set(extract_mentions(_text(rev.get("content")))))
 
     if reviewers:
-        ev["reviewers"] = sorted(set(reviewers))
+        ev["reviewers"] = sorted(set(r for r in reviewers if isinstance(r, str) and r))
 
     return ev
 
