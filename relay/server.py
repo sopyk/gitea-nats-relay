@@ -30,16 +30,14 @@ logger = logs_mod.get_logger()
 _bad_sig = logs_mod.RateLimiter(limit=5, window=60.0, aggregate_every=25)
 
 
-def log_stack(where=""):
-    """统一记录未预期异常 —— 位置保留在 server.py，一眼能看出是哪一层炸的。
+def log_stack(where="", **fields):
+    """记录未预期异常 —— 位置保留在 server.py，一眼能看出是哪一层炸的。
 
-    堆栈交给 logging 自己处理（exc_info），字段走 logs.event 的 extra ——
-    **不能**写成 `logger.exception(msg, layer=where)`：那样 `layer` 会被当成
-    logging 的关键字参数，而 Logger._log() 不认，会抛 TypeError。这行代码
-    在异常处理器里，处理器自己一抛，客户端拿到的是连接重置而不是 500。
+    `fields` 由调用方（Handler._stack）传入本请求已累积的元数据，让堆栈
+    能按 delivery 与请求关联上。
     """
     logs_mod.event(logger, logging.ERROR, "未处理的异常",
-                   layer=where or "server", exc_info=True)
+                   layer=where or "server", exc_info=True, **fields)
 
 
 # 进程启动时刻，供 /version 报 uptime 用。
@@ -99,12 +97,57 @@ class Handler(BaseHTTPRequestHandler):
 
     def setup(self):
         super().setup()
+        # _started / _fields 是**每请求**状态，不是每连接状态。
+        # setup() 只在建立连接时调用一次，而 HTTP/1.1 keep-alive 下同一个
+        # 实例会循环处理多个请求（handle → handle_one_request 循环）。
+        # 所以这里只是给个初值，真正的重置在 _begin_request()。
         self._started = None
         self._fields = {}
 
+    def _begin_request(self):
+        """每个请求的入口都必须调它，清掉上一个请求留下的现场。
+
+        不清会怎样（实测过，同一条 TCP 连接上「正常投递 → 401 → 404」）：
+
+          delivery=attack-1 ... repo=SECRET-REPO number=999 actor=secret-actor
+          mentions=[alice] status=401 decision=bad-signature
+
+        那是一条**未通过验签**的请求，日志却挂着上一个合法请求的仓库、
+        作者和 PR 号。更糟的是 404 那行会带上 `provider=gitea` 和上一个
+        请求的 event/kind —— 而 404 意味着压根没匹配到 provider。
+
+        根因是 _mark() 会跳过 None/""（避免打一堆空字段），所以提前返回的
+        分支不会覆盖掉全部字段，残留就留到了下一次请求。
+        """
+        self._started = time.monotonic()
+        self._fields = {}
+
     def _mark(self, **fields):
-        """往本次请求的日志字段里塞东西。只在本地累积，不立刻落盘。"""
+        """往本次请求的日志字段里塞东西。只在本地累积，不立刻落盘。
+
+        跳过 None / "" 是为了不打一堆空字段；代价是**提前返回的分支
+        不会覆盖掉全部字段** —— 这正是 _begin_request 必须清空字典的
+        原因，否则残留会串到下一个请求。
+        """
         self._fields.update({k: v for k, v in fields.items() if v not in (None, "")})
+
+    def _stack(self, where):
+        """记录未预期异常，**并带上本请求已累积的字段**。
+
+        堆栈必须是可关联的：整个日志功能的承诺是「按 delivery 查」，而
+        排障时最想要的那一坨堆栈如果只有一句 `layer=_process`，跟这次
+        请求是什么事件、哪个仓库完全对不上，等于没有。
+
+        这里刻意复用 self._fields 而不是只补一个 delivery —— 出错时
+        通常已经 normalize 过了，repo/actor/mentions 都在里面。
+
+        注意层号必须走 logs.event 的 extra，**不能**写成
+        `logger.exception(msg, layer=where)`：那样 layer 会被当成
+        logging 的关键字参数，Logger._log() 不认，会抛 TypeError。
+        而这行代码在异常处理器里，处理器自己一抛，客户端拿到的是
+        连接重置而不是本该给它的 500。
+        """
+        log_stack(where, **dict(self._fields))
 
     def _log_request(self, code, decision, extra):
         """把一次请求记成一行。
@@ -182,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
         return urlsplit(self.path).path or "/"
 
     def do_GET(self):
-        self._started = time.monotonic()
+        self._begin_request()
         route = self._route()
         if route == "/healthz":
             ok = self.app.healthz()
@@ -245,7 +288,7 @@ class Handler(BaseHTTPRequestHandler):
         return (self.rfile.read(length) if length else b""), None
 
     def do_POST(self):
-        self._started = time.monotonic()
+        self._begin_request()
         route = self._route()
         provider = self.app.registry.get(route)
         self._mark(path=route)
@@ -260,7 +303,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa
             # 兜底：任何漏网的异常都在这里变成一个诚实的 500，而不是
             # 异常逃出去 → 客户端连接被重置、看不到任何状态码。
-            log_stack("do_POST")
+            self._stack("do_POST")
             self._reply(500, "internal-error")
 
     def _handle(self, provider):
@@ -312,12 +355,18 @@ class Handler(BaseHTTPRequestHandler):
             # 会被永久卡在 inflight，平台每次重试都只拿到一个误导性的
             # 409（"上一次还在处理中"，实际上早就不处理了），直到进程重启。
             self.app.seen.rollback(delivery)
-            log_stack("_process")
+            self._stack("_process")
             self._reply(500, "publish-error", delivery=delivery)
 
     def _process(self, provider, body, delivery):
-        # 正文只在 log_bodies 逃生开关打开时才会传下去，默认拿不到。
-        # 见 logs._FORBIDDEN_FIELDS —— 即使这里传了，格式化那层也会再剥一次。
+        # 逃生开关打开时，把**完整原始 payload** 记进 body 字段。
+        #
+        # 记整个 payload 而不是只记 comment.body：解析 bug 可能出在
+        # sender / issue / 任意一层，只记一段会让人以为是别的问题。
+        # 代价是它含**全部**用户提交的内容（不止评论正文），所以默认关，
+        # 且文档里必须把这一点讲清楚 —— 说成「记评论正文」是误导。
+        #
+        # 见 logs._BODY_FIELDS —— 即使这里传了，默认配置下也会被剥掉。
         if self.app.cfg.logging.log_bodies:
             self._mark(body=body.decode("utf-8", "replace"))
 

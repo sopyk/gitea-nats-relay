@@ -36,6 +36,7 @@ Gitea / Forgejo 是**第一个接入方**，本文档以它作为完整示例；
 | **TOML 配置加载 + 环境变量覆盖** | ✅ 可用 |
 | **启动配置校验**：未知键 / 非法 kind / 两表冲突告警 | ✅ 可用 |
 | **结构化日志**：每请求一行，带 delivery / subject / 耗时；轮转有上限 | ✅ 可用 |
+| **日志防注入**：值里的换行/ANSI 不会伪造出一条日志 | ✅ 可用 |
 | **日志隐私规则**：只记已投递给 Agent 的字段，不记正文与密钥 | ✅ 可用 |
 | **401 限流**（未认证请求刷不爆日志） | ✅ 可用 |
 | **subject 前缀校验**：通配符 / 公告与定向撞车，启动即报错 | ✅ 可用 |
@@ -622,6 +623,15 @@ Agent 消息里 `mentions` 是空的，日志里也是空的 —— 两边一样
 
 这时把 `[logging] log_bodies` 临时改成 `true`，重启，抓一次，然后关回去。
 
+> ⚠️ **它记的是完整的原始 payload，不只是评论正文。**
+> 解析 bug 可能出在 `sender` / `issue` / 任意一层，只记一段反而会让人
+> 误以为是别的问题 —— 但代价是**日志里会出现用户提交的全部内容**。
+> 上限 8000 字符，超出会标出被截了多少。
+> 里面的值仍然经过控制字符转义，所以正文里的换行不会把日志劈成两行。
+
+`log_bodies` 只放行正文类字段（`body` / `comment_body` / `review_content`）。
+**密钥类字段（`secret` / `password` / `signature` / `token` / …）没有任何开关**。
+
 ### JSON 格式
 
 给 log shipper 用：
@@ -630,6 +640,24 @@ Agent 消息里 `mentions` 是空的，日志里也是空的 —— 两边一样
 [logging]
 format = "json"
 ```
+
+### NATS 抖动期间 relay 会回 200 —— 这是有意的
+
+实测确认（`test_e2e.PublishFailureTest`）：
+
+| 时刻 | relay 行为 |
+|---|---|
+| NATS 停机期间投递 | 回 `200 accepted`，消息进重连队列 |
+| NATS 恢复后 | **消息被补发**，订阅端确实收到 |
+| relay 进程在断连期间重启 | 缓冲区随进程消失，消息丢失 |
+
+所以 `200` 在这里是诚实的：平台不会重试，relay 自己保证补发。
+
+**代价**：宁可重复也不丢（`max_reconnect_attempts=-1` + 缓冲）。
+反过来如果停机期间报 502，平台会重试，叠加补发就是重复门铃 —— 那更糟。
+
+**唯一真实的丢失窗口**是最后一行：NATS 断着的时候重启 relay。
+排查「某条门铃彻底没出现」时，先看 relay 的启动时间是不是在那次抖动里。
 
 ### 不做 `/metrics`
 
@@ -683,7 +711,13 @@ cd relay
 python3 test_internals.py         # 配置加载/校验、provider、归一化、@提及、去重、路由
 python3 test_relay.py             # HTTP 端到端：真 socket、真 HMAC，只有 NATS 是假的
 python3 test_logs.py              # 日志：降级、隐私、限流、轮转、结构性护栏
+python3 test_e2e.py               # 仿真：keep-alive / 注入 / 并发 / 真实 NATS 全链路
 ```
+
+> `test_e2e.py` 需要 docker 或 `W2N_NATS`（会自动拉起一个 nats 容器）。
+> 起不来时那几组会 **skip 并说明原因**，不是静默通过。
+> 它内置的订阅端是**手写的裸 socket**（不依赖 nats-py），所以验的是
+> 线上真实协议字节 —— 顺带证明 relay 的输出对「不用 nats-py 的订阅者」也成立。
 
 **`relay/fixtures.py` 里的 payload 严格对照 Gitea `modules/structs/hook.go` 的结构体造**，不是凭印象编的 —— 正是那几个结构体里藏着本项目踩过的坑（payload 没有 `action_at`、`ReviewPayload` 用 `content` 而非 `body`、`requested_reviewer` 是顶层单数字段）。
 
@@ -705,6 +739,18 @@ python3 test_logs.py              # 日志：降级、隐私、限流、轮转�
 最后一条是这套测试的关键：护栏测试自己也可能是摆设。所以每条结构
 性断言都配了一条「故意破坏 → 必须报错」的反向自检。
 
+`test_e2e.py` 打的是**真 socket**，因为下面这些问题伪造 Handler 实例
+根本测不出来 —— 全都是实打实撞上才发现的：
+
+| 测试 | 钉住的事 |
+|---|---|
+| keep-alive 字段污染 | 同一条连接上的请求**不共用日志字段**（实测：401 行会挂上一个合法请求的仓库和作者，404 行会带上 `provider=gitea`） |
+| 日志注入 | payload 字段 / 正文里的换行**不能伪造出一条日志**；ANSI 转义被中和 |
+| 堆栈可见 | text 是默认格式，它**必须**输出堆栈；且堆栈行带 `delivery`（否则按 delivery 查堆栈查不到） |
+| 并发 | 40 个并发请求 → 40 条干净日志，字段不互串 |
+| 真实 NATS | **消息真的到达订阅端**，subject 与内容都对；日志的 delivery 与消息的对得上 |
+| NATS 抖动 | 停机期间回 200，恢复后**消息真的补发**（这是实测结论，见上文） |
+
 ## 目录结构
 
 ```
@@ -719,6 +765,7 @@ relay/
   test_internals.py # 单元测试
   test_relay.py     # HTTP 端到端测试
   test_logs.py      # 日志的降级/隐私/限流护栏
+  test_e2e.py       # 仿真测试：keep-alive / 注入 / 并发 / 真实 NATS
   Dockerfile
 config/
   webhook2nats.example.toml   # 配置模板（无环境值，可进库）
