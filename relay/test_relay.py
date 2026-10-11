@@ -307,7 +307,8 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertEqual(self.post(p, delivery="f1"), (200, b"accepted"))
         self.assertEqual(self.post(p, delivery="f1"), (200, b"duplicate"))
 
-    def test_publish_timeout_rolls_back(self):
+    def test_publish_timeout_rolls_back_and_allows_retry(self):
+        """超时后 delivery 必须回滚，平台能用同一 UUID 重投。"""
         p = fixtures.issue_comment(body="@mayaoyao 看看")
         self.relay.targets = [("h1", "mayaoyao")]
         self.relay.hang = True
@@ -315,7 +316,9 @@ class WebhookBehaviorTest(HttpTestBase):
         self.assertEqual(status, 504)
         self.assertEqual(body, b"publish-timeout")
         self.assertGreaterEqual(self.relay.cancelled, 1,
-                                "超时应尝试 cancel，避免协程继续跑完")
+                                "超时应尝试 cancel")
+        app = self.httpd.RequestHandlerClass.app
+        self.assertNotIn("t1", app.seen.inflight)
         self.relay.hang = False
         self.assertEqual(self.post(p, delivery="t1"), (200, b"accepted"))
 
@@ -329,6 +332,54 @@ class WebhookBehaviorTest(HttpTestBase):
         status, body = self.post(None, raw_body=b"x" * (2 * 1024 * 1024))
         self.assertEqual(status, 413)
         self.assertEqual(body, b"payload-too-large")
+
+    def test_oversized_body_does_not_poison_next_request(self):
+        """413 之后残余的 body 字节不能被当成下一个请求行。
+
+        服务端是 HTTP/1.1 keep-alive：提前返回 413 而不读干净 socket，
+        残留字节会污染下一次请求，表现为莫名其妙的 400。
+        """
+        big = b"x" * (server_mod.MAX_BODY_BYTES + 1024)
+        status, _ = self._http(self._raw(big, delivery="big", event="issues"))
+        self.assertEqual(status, 413)
+        # 同一条连接紧接着发一个正常请求，应当被正常处理
+        p = fixtures.issue_comment(body="@mayaoyao 看看")
+        self.relay.targets = [("h1", "mayaoyao")]
+        body = json.dumps(p, ensure_ascii=False).encode()
+        sig = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+        head = (f"POST /gitea-hook HTTP/1.1\r\nHost: x\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"X-Gitea-Delivery: after-big\r\n"
+                f"X-Gitea-Signature: {sig}\r\n"
+                f"X-Gitea-Event: issue_comment\r\n\r\n").encode() + body
+        status2, resp2 = self._http(head)
+        self.assertEqual(status2, 200, f"后续请求被污染了: {resp2!r}")
+
+    def test_unknown_path_drains_body(self):
+        """404 路径同样要读干净 body，否则 keep-alive 下污染下一个请求。"""
+        body = b'{"repository":"a-string-not-an-object"}'
+        status, _ = self._http(self._raw(body, path="/nope", event="issues"))
+        self.assertEqual(status, 404)
+        p = fixtures.issue_comment(body="@mayaoyao 看看")
+        self.relay.targets = [("h1", "mayaoyao")]
+        body2 = json.dumps(p, ensure_ascii=False).encode()
+        sig = hmac.new(SECRET.encode(), body2, hashlib.sha256).hexdigest()
+        head = (f"POST /gitea-hook HTTP/1.1\r\nHost: x\r\n"
+                f"Content-Length: {len(body2)}\r\n"
+                f"X-Gitea-Delivery: after-404\r\n"
+                f"X-Gitea-Signature: {sig}\r\n"
+                f"X-Gitea-Event: issue_comment\r\n\r\n").encode() + body2
+        status2, resp2 = self._http(head)
+        self.assertEqual(status2, 200, f"后续请求被污染了: {resp2!r}")
+
+    def _raw(self, body, path="/gitea-hook", event="issues", delivery="d"):
+        """构造一个签名单字面量、不再改写的原始请求。"""
+        sig = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+        return (f"POST {path} HTTP/1.1\r\nHost: x\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                f"X-Gitea-Delivery: {delivery}\r\n"
+                f"X-Gitea-Signature: {sig}\r\n"
+                f"X-Gitea-Event: {event}\r\n\r\n").encode() + body
 
     def test_unknown_path_404(self):
         self.assertEqual(self.post(fixtures.issue_comment(), path="/nope")[0], 404)

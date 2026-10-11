@@ -3,7 +3,8 @@ WORKDIR /app
 RUN pip install --no-cache-dir "nats-py>=2.16,<3"
 # 只烤代码，不烤身份映射：members.json 由宿主 ./config 只读挂载到 /config
 COPY *.py /app/
-ENV MEMBERS_FILE=/config/members.json
+# 刻意不设 MEMBERS_FILE 等路径类环境变量：它们优先级高于配置文件，
+# 在镜像里烤死默认值会让 config/webhook2nats.toml 里的对应项永远不生效。
 ENV PYTHONDONTWRITEBYTECODE=1
 EXPOSE 8090
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

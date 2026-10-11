@@ -6,6 +6,7 @@
 职责边界见 README。本文件只做装配，不含业务逻辑。
 """
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -59,14 +60,24 @@ class Relay:
                 log("heartbeat error:", e)
             await asyncio.sleep(self.cfg.heartbeat_seconds)
 
+    def _nats_timeout(self):
+        """NATS 侧预算必须**小于** HTTP 层预算。
+
+        publish_timeout_seconds 是 HTTP 层的等待上限。如果两处用同一个值，
+        HTTP 的计时从 submit_event 起算，而 flush 的计时要等 publish 返回之后
+        才开始 —— 于是 HTTP 必然先超时：它回了 504、delivery 回滚、平台重试，
+        而协程还在等 PONG，稍后 flush 成功，消息**其实早已上线** → 重复门铃。
+
+        cancel() 救不了这个：它中止的是「等 PONG」，撤不回已经写进 socket 的字节。
+        唯一能缩小这个窗口的办法是让 NATS 先于 HTTP 放弃。
+        """
+        return max(0.1, self.cfg.publish_timeout_seconds * 0.8)
+
     async def _publish(self, subject, obj):
-        import json
         data = json.dumps(obj, ensure_ascii=False).encode()
         await self.nc.publish(subject, data)
-        # 把超时传进去：旧代码不传，用的是 nats-py 的默认 10s，
-        # 而 HTTP 层 3s 就返回 504 了 —— 协程仍会继续跑完并可能投递成功，
-        # 平台再重试一次就成了重复门铃。
-        await self.nc.flush(timeout=self.cfg.publish_timeout_seconds)
+        # 传 timeout 而不是用 nats-py 的默认 10s —— 见 _nats_timeout 的说明
+        await self.nc.flush(timeout=self._nats_timeout())
 
     def subjects_for(self, ev):
         subjects = []

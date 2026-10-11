@@ -26,10 +26,18 @@ class Seen:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         try:
             with open(path, encoding="utf-8") as f:
-                for k in json.load(f):
-                    self.od[k] = True
+                data = json.load(f)
         except (FileNotFoundError, ValueError):
-            pass
+            data = []
+        # 内容是合法 JSON 但类型不对时（手滑写成字符串或数字数组），
+        # 迭代出来的是字符或 int，begin(uuid) 会永远 miss —— 去重静默失效，
+        # 于是 relay 重启后会把所有事件重发一遍。宁可当作空状态重来。
+        if not isinstance(data, list) or not all(isinstance(k, str) for k in data):
+            if data:
+                print(f"[relay] WARN dedup file {path} 内容不是字符串数组，已按空状态重建",
+                      flush=True)
+            data = []
+        self.od.update({k: True for k in data})
         while len(self.od) > self.cap:
             self.od.popitem(last=False)
 

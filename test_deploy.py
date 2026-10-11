@@ -384,6 +384,25 @@ class ComposeTest(unittest.TestCase):
         self.assertNotIn("build:", run)
         self.assertIn("build:", build)
 
+    def test_compose_does_not_shadow_config_file(self):
+        """compose 不得设置路径类环境变量。
+
+        环境变量优先级高于配置文件。在 compose 里写死 MEMBERS_FILE / DEDUP_FILE
+        （哪怕值和默认值一样），会让运维在 webhook2nats.toml 里的对应设置**静默失效**，
+        且没有任何提示。Dockerfile 里烤 ENV 同理。
+        """
+        for p in (COMPOSE_RUN, COMPOSE_BUILD):
+            body = strip_comments(open(p, encoding="utf-8").read())
+            for var in ("MEMBERS_FILE", "DEDUP_FILE", "LISTEN", "CONFIG_FILE"):
+                self.assertNotIn(f"{var}:", body,
+                                 f"{os.path.basename(p)} 里的 {var} 会盖掉配置文件")
+        df = open(os.path.join(ROOT, "relay", "Dockerfile"), encoding="utf-8").read()
+        for line in df.splitlines():
+            if line.startswith("ENV "):
+                for var in ("MEMBERS_FILE", "DEDUP_FILE", "LISTEN", "CONFIG_FILE"):
+                    self.assertNotIn(f"{var}=", line,
+                                     f"Dockerfile 里的 {var} 会盖掉配置文件")
+
     def test_security_invariants(self):
         """密钥不能进容器；members.json 必须只读。"""
         for p in (COMPOSE_RUN, COMPOSE_BUILD):

@@ -20,6 +20,10 @@ def log_stack():
 # 1MB 已经很宽松。
 MAX_BODY_BYTES = 1 * 1024 * 1024
 
+# 提前返回 4xx 时最多读掉多少字节的残余请求体。超过就直接关连接，
+# 不为一个注定失败的请求花掉读大 body 的时间。
+DRAIN_LIMIT = 64 * 1024
+
 
 class App:
     """把配置、provider、核心串起来。测试可以注入假的 publish。"""
@@ -58,6 +62,28 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._reply(404, "not-found")
 
+    def _drain(self):
+        """把请求体从 socket 里读干净。
+
+        keep-alive 下如果直接回响应就返回，剩下的 body 字节会被当成下一个请求行
+        去解析 —— 表现为莫名其妙的 400 加连接关闭。
+        """
+        try:
+            n = int(self.headers.get("Content-Length", "0") or 0)
+        except (TypeError, ValueError):
+            return
+        # 超大 body 没有必要真读（客户端可能正在慢慢发），关连接即可，
+        # 所以这里限量并把连接标记为不再复用。
+        if n > DRAIN_LIMIT:
+            self.close_connection = True
+            return
+        remaining = n
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
     def _read_body(self):
         """返回 (body, error)。error 非 None 时调用方直接回对应状态码。
 
@@ -79,6 +105,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         provider = self.app.registry.get(self.path)
         if provider is None:
+            # 路径没匹配上，但请求体可能还在 socket 上 —— 不 drain 的话
+            # keep-alive 下残余字节会被当成下一个请求行。
+            self._drain()
             self._reply(404, "not-found")
             return
         try:
@@ -92,13 +121,16 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self, provider):
         body, err = self._read_body()
         if err == "bad-length":
+            self._drain()
             self._reply(400, "bad-length")
             return
         if err == "too-large":
+            self._drain()
             self._reply(413, "payload-too-large")
             return
 
         if not provider.verify(body, self.headers):
+            # body 已经读完了，不用 drain
             self._reply(401, "bad-signature")
             return
 

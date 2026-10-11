@@ -45,10 +45,10 @@ services:
       - ./relay.env
 
     environment:
-      LISTEN: "0.0.0.0:8090"
-      MEMBERS_FILE: "/config/members.json"
-      DEDUP_FILE: "/data/seen.json"
-      PYTHONDONTWRITEBYTECODE: "1"
+      # 刻意**不**在这里设 MEMBERS_FILE / DEDUP_FILE —— 代码默认值就是这两个路径，
+      # 而环境变量优先级高于配置文件，在这里重复一遍只会静默盖掉
+      # config/webhook2nats.toml 里的设置，且没有任何提示。
+      # 需要改路径请改配置文件；只有「想覆盖配置文件」时才用环境变量。
       TZ: "Asia/Shanghai"
 
     logging:

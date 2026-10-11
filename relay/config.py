@@ -10,6 +10,7 @@ env 注入的部署；TOML 落地后两边同时可用，env 继续承担容器 
 """
 import json
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 
@@ -31,6 +32,10 @@ VALID_DEDUP = frozenset({"file", "capacity"})
 VALID_PROVIDER = frozenset({"enabled", "path", "headers", "signature", "events", "event_types"})
 VALID_HEADERS = frozenset({"event", "event_type", "delivery", "signature"})
 VALID_SIGNATURE = frozenset({"algorithm", "secret"})
+
+# 能安全编进 NATS subject 的一段标识符。不允许 . * > （层级分隔符与通配符）、
+# 空格、以及任何非 ASCII —— 后者会让 subject 在不同客户端上产生歧义。
+_SAFE_SUBJECT_TOKEN = re.compile(r"[A-Za-z0-9_-]+")
 
 
 class ConfigError(Exception):
@@ -226,6 +231,74 @@ def _defaults():
     return cfg
 
 
+def _split_servers(value):
+    """NATS 服务器列表。
+
+    这里的单个裸字符串是**合法且常见**的（`servers = "nats://a:4222"`），
+    因为它看起来就不像「漏了中括号」—— 里面本来就带分隔符和端口。
+    所以不走 _split_list 的严格规则。
+    """
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(",") if x.strip()]
+    if isinstance(value, list) and all(isinstance(x, str) for x in value):
+        return [x.strip() for x in value if x.strip()]
+    raise ConfigError(
+        f"[nats] servers 必须是字符串或字符串数组，实际是 {type(value).__name__}")
+
+
+def _split_list(value):
+    """把字符串或字符串数组归一化成列表。
+
+    裸字符串只在**确实像逗号列表**时才接受：`"a,b"` 可以（与环境变量写法一致），
+    但 `"alice"` 不行 —— 那是 `["alice"]` 漏了中括号，而 split(",") 会把它切成
+    {'a','l','i','c','e'}，让 broadcast_authors 静默变成一堆单字母，
+    全厅公告永久失效且没有任何报错。判断依据是逗号前后没有空格/空白，
+    因为登录名里不会出现这些。
+    """
+    if isinstance(value, str):
+        parts = [x.strip() for x in value.split(",") if x.strip()]
+        # 单个裸字符串：无法区分「本意是一个」还是「本意是列表但漏了括号」，
+        # 拒绝更安全 —— 报错比静默投错人好。
+        if len(parts) > 1:
+            return parts
+        raise ConfigError(
+            f'{value!r} 看起来像单个字符串。若是一个值请写成 ["{value}"]；'
+            f'多个值请写成 ["a", "b"] 或 "a,b"')
+    if isinstance(value, list) and all(isinstance(x, str) for x in value):
+        return [x.strip() for x in value if x.strip()]
+    raise ConfigError(
+        f"必须是字符串或字符串数组，实际是 {type(value).__name__}"
+        f' —— 例如写成 ["a", "b"] 或 "a,b"')
+
+
+def _as_str_list(section, key, value):
+    """集合语义（broadcast_authors）—— 去重，顺序无所谓。"""
+    return set(_split_list_value(section, key, value))
+
+
+def _as_str_list_ordered(section, key, value):
+    """有序语义（nats.servers）—— failover 依赖顺序，不能去重。"""
+    return _split_servers(value)
+
+
+def _split_list_value(section, key, value):
+    try:
+        return _split_list(value)
+    except ConfigError as e:
+        raise ConfigError(f"[{section}] {key} {e}") from None
+
+
+def _as_positive_number(section, key, value, cast, minimum):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"[{section}] {key} 必须是数字，实际是 {type(value).__name__}")
+    num = cast(value)
+    if num <= minimum:
+        raise ConfigError(
+            f"[{section}] {key} 必须大于 {minimum}，实际是 {num}"
+            + ("（0 会让心跳变成打 NATS 的忙循环）" if key == "heartbeat_seconds" else ""))
+    return num
+
+
 def load(path=None, env=None, warn=None):
     """加载配置：文件 → 环境变量覆盖 → 校验。
 
@@ -247,31 +320,51 @@ def load(path=None, env=None, warn=None):
         _reject_unknown("[service]", svc, VALID_SERVICE, "[service]")
         for k in ("listen", "client_name", "relay_id"):
             if k in svc:
+                if not isinstance(svc[k], str):
+                    raise ConfigError(f"[service] {k} 必须是字符串")
                 setattr(cfg, k, svc[k])
         if "heartbeat_seconds" in svc:
-            cfg.heartbeat_seconds = int(svc["heartbeat_seconds"])
+            cfg.heartbeat_seconds = _as_positive_number(
+                "service", "heartbeat_seconds", svc["heartbeat_seconds"], int, 0)
         if "publish_timeout_seconds" in svc:
-            cfg.publish_timeout_seconds = float(svc["publish_timeout_seconds"])
+            cfg.publish_timeout_seconds = _as_positive_number(
+                "service", "publish_timeout_seconds", svc["publish_timeout_seconds"],
+                float, 0)
 
         nat = raw.get("nats", {})
         _reject_unknown("[nats]", nat, VALID_NATS, "[nats]")
-        cfg.nats_servers = nat.get("servers", cfg.nats_servers)
-        cfg.nats_user = nat.get("user", cfg.nats_user)
-        cfg.nats_password = nat.get("password", cfg.nats_password)
+        # 环境变量侧支持逗号分隔，文件侧也支持 —— 否则同一个语义两条路径
+        # 实现不一致，写成 "a:4222,b:4222" 会得到一个字符串而不是数组。
+        if "servers" in nat:
+            # servers 要保序（nats.connect 会按顺序尝试 failover），
+            # 所以走列表版本而不是集合版本。
+            cfg.nats_servers = _as_str_list_ordered("nats", "servers", nat["servers"])
+        for k in ("user", "password"):
+            if k in nat:
+                if not isinstance(nat[k], str):
+                    raise ConfigError(f"[nats] {k} 必须是字符串")
+                setattr(cfg, f"nats_{k}", nat[k])
 
         rt = raw.get("routing", {})
         _reject_unknown("[routing]", rt, VALID_ROUTING, "[routing]")
-        if "members_file" in rt:
-            cfg.members_file = rt["members_file"]
-        cfg.notify_subject_prefix = rt.get("notify_subject_prefix", cfg.notify_subject_prefix)
-        cfg.broadcast_subject = rt.get("broadcast_subject", cfg.broadcast_subject)
+        for k in ("members_file", "notify_subject_prefix", "broadcast_subject"):
+            if k in rt:
+                if not isinstance(rt[k], str):
+                    raise ConfigError(f"[routing] {k} 必须是字符串")
+                setattr(cfg, k, rt[k])
         if "broadcast_authors" in rt:
-            cfg.broadcast_authors = set(rt["broadcast_authors"])
+            cfg.broadcast_authors = _as_str_list(
+                "routing", "broadcast_authors", rt["broadcast_authors"])
 
         dd = raw.get("dedup", {})
         _reject_unknown("[dedup]", dd, VALID_DEDUP, "[dedup]")
-        cfg.dedup_file = dd.get("file", cfg.dedup_file)
-        cfg.dedup_capacity = int(dd.get("capacity", cfg.dedup_capacity))
+        if "file" in dd:
+            if not isinstance(dd["file"], str):
+                raise ConfigError("[dedup] file 必须是字符串")
+            cfg.dedup_file = dd["file"]
+        if "capacity" in dd:
+            cfg.dedup_capacity = _as_positive_number(
+                "dedup", "capacity", dd["capacity"], int, 0)
 
         for name, praw in raw.get("providers", {}).items():
             cfg.providers[name] = _build_provider(name, praw, warn)
@@ -328,7 +421,20 @@ def load_members(path):
                 and isinstance(ident, str) and ident.strip()):
             bad.append(f"{login}（host/id 缺失或非字符串）")
             continue
-        members[login] = {"host": host.strip(), "id": ident.strip()}
+        host, ident = host.strip(), ident.strip()
+        # host/id 会被编进 subject <prefix>.<host>。<id>。点号是 NATS 的层级分隔符，
+        # 一个手误（id 写成 "a.b"）会生成 evt.gitea.notify.h1.a.b ——
+        # 那是**另一个** Agent 的收件位，门铃直接投错人，且不会有任何报错。
+        # 星号/尖括号是 NATS 通配符，在服务端 ACL 上同样危险。
+        ok = True
+        for field, value in (("host", host), ("id", ident)):
+            if not _SAFE_SUBJECT_TOKEN.fullmatch(value):
+                bad.append(f"{login}（{field}={value!r} 含非法字符，"
+                           f"只允许字母/数字/下划线/连字符）")
+                ok = False
+        if not ok:
+            continue
+        members[login] = {"host": host, "id": ident}
     if bad:
         raise ConfigError(
             f"成员映射 {path} 有 {len(bad)} 条不合法，已全部拒绝：\n  "

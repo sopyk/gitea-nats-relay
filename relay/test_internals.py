@@ -417,6 +417,178 @@ class MembersTest(unittest.TestCase):
             }}))
 
 
+class ConfigTypeTest(unittest.TestCase):
+    """F14：TOML 不做类型校验，写错类型曾导致功能静默永久失效。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.base = ('[nats]\nservers = ["nats://x:4222"]\nuser = "u"\npassword = "p"\n'
+                     '[providers.gitea]\npath = "/h"\n'
+                     '[providers.gitea.headers]\nevent = "X-E"\n'
+                     '[providers.gitea.signature]\nsecret = "s"\n'
+                     '[providers.gitea.events]\nissues = "issue"\n')
+
+    def load_with(self, extra, env=None):
+        path = os.path.join(self.tmp, "c.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(self.base + extra)
+        return config_mod.load(path=path, env=dict(GITEA_ENV) if env is None else env)
+
+    def test_broadcast_authors_as_bare_string_rejected(self):
+        """写成 "alice"（漏了中括号）曾得到 {'a','l','i','c','e'}，
+        全厅公告永久静默失效且无任何报错。"""
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_with('\n[routing]\nbroadcast_authors = "alice"\n')
+        self.assertIn("broadcast_authors", str(cm.exception))
+
+    def test_broadcast_authors_comma_string_accepted(self):
+        cfg = self.load_with('\n[routing]\nbroadcast_authors = "alice,bob"\n')
+        self.assertEqual(cfg.broadcast_authors, {"alice", "bob"})
+
+    def test_broadcast_authors_wrong_type_rejected(self):
+        for bad in ("123", "true", '{"k":"v"}', "[1, 2]"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(config_mod.ConfigError):
+                    self.load_with(f'\n[routing]\nbroadcast_authors = {bad}\n')
+
+    def test_servers_comma_string_accepted_and_ordered(self):
+        """环境变量侧支持逗号分隔，文件侧曾不支持 —— 同一语义两条路径不一致。"""
+        cfg = self.load_with('\n')
+        path = os.path.join(self.tmp, "c2.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('[nats]\nservers = "nats://a:4222,nats://b:4222"\n'
+                    'user = "u"\npassword = "p"\n'
+                    '[providers.gitea]\npath = "/h"\n'
+                    '[providers.gitea.headers]\nevent = "X-E"\n'
+                    '[providers.gitea.signature]\nsecret = "s"\n'
+                    '[providers.gitea.events]\nissues = "issue"\n')
+        cfg = config_mod.load(path=path, env={})
+        self.assertEqual(cfg.nats_servers, ["nats://a:4222", "nats://b:4222"],
+                         "servers 必须保序（failover 依赖顺序）")
+
+    def test_servers_wrong_type_rejected(self):
+        path = os.path.join(self.tmp, "c3.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('[nats]\nservers = 4222\nuser = "u"\npassword = "p"\n'
+                    '[providers.gitea]\npath = "/h"\n'
+                    '[providers.gitea.headers]\nevent = "X-E"\n'
+                    '[providers.gitea.signature]\nsecret = "s"\n'
+                    '[providers.gitea.events]\nissues = "issue"\n')
+        with self.assertRaises(config_mod.ConfigError):
+            config_mod.load(path=path, env={})
+
+    def test_zero_heartbeat_rejected(self):
+        """0 会让 asyncio.sleep(0) 变成打 NATS 的忙循环。"""
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            self.load_with('\n[service]\nheartbeat_seconds = 0\n')
+        self.assertIn("heartbeat_seconds", str(cm.exception))
+
+    def test_negative_and_bool_numbers_rejected(self):
+        for bad in ("-1", "true"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(config_mod.ConfigError):
+                    self.load_with(f'\n[service]\nheartbeat_seconds = {bad}\n')
+
+    def test_non_string_scalars_rejected(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load_with('\n[service]\nclient_name = 123\n')
+
+    def test_dedup_capacity_zero_rejected(self):
+        with self.assertRaises(config_mod.ConfigError):
+            self.load_with('\n[dedup]\ncapacity = 0\n')
+
+
+class MembersSubjectSafetyTest(unittest.TestCase):
+    """F15：host/id 会被编进 NATS subject，含 . 会投到别人的收件位。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        import json
+        self.path = os.path.join(self.tmp, "m.json")
+
+    def write(self, obj):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
+        return self.path
+
+    def test_dot_in_id_rejected(self):
+        """evt.gitea.notify.h1.a.b 是**另一个** Agent 的收件位。"""
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            config_mod.load_members(self.write(
+                {"members": {"alice": {"host": "h1", "id": "a.b"}}}))
+        self.assertIn("非法字符", str(cm.exception))
+
+    def test_wildcards_rejected(self):
+        for bad in ("*", ">", "a*", "a>b"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(config_mod.ConfigError):
+                    config_mod.load_members(self.write(
+                        {"members": {"x": {"host": "h1", "id": bad}}}))
+
+    def test_space_and_unicode_rejected(self):
+        for bad in ("a b", "a\nb", "张三"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(config_mod.ConfigError):
+                    config_mod.load_members(self.write(
+                        {"members": {"x": {"host": "h1", "id": bad}}}))
+
+    def test_dangerous_host_rejected(self):
+        with self.assertRaises(config_mod.ConfigError):
+            config_mod.load_members(self.write(
+                {"members": {"x": {"host": "h.1", "id": "ok"}}}))
+
+    def test_valid_tokens_accepted(self):
+        m = config_mod.load_members(self.write(
+            {"members": {"alice": {"host": "h1", "id": "a-1_b"}}}))
+        self.assertEqual(m["alice"], {"host": "h1", "id": "a-1_b"})
+
+    def test_error_names_the_offending_login(self):
+        with self.assertRaises(config_mod.ConfigError) as cm:
+            config_mod.load_members(self.write({"members": {
+                "good": {"host": "h1", "id": "good"},
+                "bad": {"host": "h1", "id": "a.b"},
+            }}))
+        self.assertIn("bad", str(cm.exception))
+
+
+class SeenCorruptionTest(unittest.TestCase):
+    """F16：内容是合法 JSON 但类型不对时，去重会静默失效。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "seen.json")
+
+    def test_string_payload_treated_as_empty(self):
+        """手滑写成 "abc" 时，迭代出 {'a','b','c'}，
+        begin(uuid) 永远 miss → relay 重启后把所有事件重发一遍。"""
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('"abc"')
+        s = core.Seen(self.path)
+        self.assertEqual(s.begin("some-uuid"), "reserved")
+
+    def test_int_array_treated_as_empty(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        self.assertEqual(core.Seen(self.path).begin("x"), "reserved")
+
+    def test_mixed_array_treated_as_empty(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('["ok", 5, null]')
+        self.assertEqual(core.Seen(self.path).begin("y"), "reserved")
+
+    def test_valid_list_still_honoured(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('["a", "b"]')
+        s = core.Seen(self.path)
+        self.assertEqual(s.begin("a"), "seen")
+        self.assertEqual(s.begin("b"), "seen")
+
+    def test_empty_file_ok(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("")
+        self.assertEqual(core.Seen(self.path).begin("z"), "reserved")
+
+
 class RoutingTest(unittest.TestCase):
     def setUp(self):
         self.members = core.Members({
@@ -581,6 +753,43 @@ issue_comment = "issue_comment"
     def test_same_recipient_not_published_twice(self):
         ev = {"assignees": ["alice"], "mentions": ["alice"], "reviewers": ["alice"]}
         self.assertEqual(self.relay.subjects_for(ev), ["evt.gitea.notify.h1.alice"])
+
+    def test_nats_timeout_is_shorter_than_http_timeout(self):
+        """NATS 侧预算必须小于 HTTP 层预算。
+
+        否则 HTTP 必然先超时：它回 504、delivery 回滚、平台重试，
+        而协程还在等 PONG，稍后 flush 成功 —— 消息其实早已上线，
+        于是重复门铃。cancel() 撤不回已经写进 socket 的字节。
+        """
+        self.assertLess(self.relay._nats_timeout(),
+                        self.relay.cfg.publish_timeout_seconds)
+
+    def test_nats_timeout_never_zero(self):
+        """publish_timeout_seconds 配得极小时，NATS 预算不能变成 0
+        （flush(0) 会直接抛 BadTimeoutError）。"""
+        self.relay.cfg.publish_timeout_seconds = 0.01
+        self.assertGreater(self.relay._nats_timeout(), 0)
+
+    def test_flush_receives_the_timeout(self):
+        """flush 必须显式传 timeout —— 不传就用 nats-py 的 10s 默认值，
+        比 HTTP 层慢一大截，重复投递窗口被放大到最大。"""
+        import asyncio
+        seen = {}
+
+        class NC:
+            is_connected = True
+
+            async def publish(self, s, d):
+                pass
+
+            async def flush(self, timeout=None):
+                seen["timeout"] = timeout
+
+        self.relay.nc = NC()
+        asyncio.run(self.relay._publish("s", {"k": 1}))
+        self.assertIsNotNone(seen.get("timeout"),
+                             "flush 没拿到 timeout —— 会退回 10s 默认值")
+        self.assertLessEqual(seen["timeout"], self.relay.cfg.publish_timeout_seconds)
 
     def test_empty_event_yields_nothing(self):
         self.assertEqual(self.relay.subjects_for({}), [])
