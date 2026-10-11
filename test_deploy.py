@@ -344,21 +344,39 @@ class ComposeTest(unittest.TestCase):
     def test_build_context_matches_dockerfile_location(self):
         df_path = os.path.join(ROOT, "relay", "Dockerfile")
         self.assertTrue(os.path.exists(df_path))
-        df = open(df_path, encoding="utf-8").read()
-        # 模块化之后是多个 .py，COPY 必须跟着改成 *.py，
-        # 否则镜像里只有一个文件，启动时 import 就炸。
-        self.assertIn("COPY *.py /app/", df,
-                      "Dockerfile 还在只 COPY 单个文件，模块化后会启动失败")
-        self.assertIn("app.py", df.split("CMD")[-1],
-                      "容器入口应指向 app.py")
+        with open(df_path, encoding="utf-8") as f:
+            df = f.read()
+        # 模块化之后是多个 .py，COPY 必须逐个列出或用 *.py，
+        # 否则镜像里少了模块，启动时 import 就炸。
+        self.assertTrue("COPY *.py /app/" in df or "COPY app.py" in df,
+                        "Dockerfile 的 COPY 没覆盖全部模块")
+        self.assertIn("app.py", df.split("CMD")[-1], "容器入口应指向 app.py")
 
     def test_every_module_is_copied(self):
-        """镜像要能 import 到每一个模块，别漏了新增的。"""
-        df = open(os.path.join(ROOT, "relay", "Dockerfile"), encoding="utf-8").read()
-        self.assertIn("COPY *.py", df)
+        """镜像要能 import 到每一个产品模块，别漏了新增的。"""
+        with open(os.path.join(ROOT, "relay", "Dockerfile"), encoding="utf-8") as f:
+            df = f.read()
+        copy_line = next((l for l in df.splitlines() if l.startswith("COPY")), "")
+        # 最后一个 token 是目标路径（/app/），其余都是源文件
+        modules = set(copy_line.split()[1:-1])
         for mod in ("app.py", "config.py", "core.py", "providers.py", "server.py"):
             self.assertTrue(os.path.exists(os.path.join(ROOT, "relay", mod)),
                             f"缺 {mod}")
+            self.assertIn(mod, modules, f"{mod} 没被 COPY 进镜像")
+
+    def test_tests_are_not_baked_into_image(self):
+        """测试文件不进交付镜像。
+
+        里面有你测试用的密钥占位符（s3cr3t）和内网主机名，
+        不该出现在别人拉下来的镜像里。测试在源码树里跑就行。
+        """
+        with open(os.path.join(ROOT, "relay", "Dockerfile"), encoding="utf-8") as f:
+            df = f.read()
+        copy_line = next((l for l in df.splitlines() if l.startswith("COPY")), "")
+        self.assertNotIn("*.py", copy_line,
+                         "COPY *.py 会把测试文件一起打进镜像")
+        for t in ("test_relay.py", "test_internals.py", "fixtures.py"):
+            self.assertNotIn(t, df, f"{t} 不应出现在 Dockerfile 里")
 
     def test_both_files_identical_apart_from_image_source(self):
         """两份 compose 只能有 build/image 两处不同，否则会悄悄漂移。
