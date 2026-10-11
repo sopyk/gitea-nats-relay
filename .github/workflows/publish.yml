@@ -82,10 +82,11 @@ jobs:
         run: |
           set -euo pipefail
           # 从 metadata-action 的 json 输出里取第一个 tag 的 digest
-          digest=$(echo "$TAGS_JSON" | python3 -c "
+          # metadata-action 的 json 输出里 tags 是 list[str]，不是 dict
+          image=$(echo "$TAGS_JSON" | python3 -c "
           import json,sys
           d=json.load(sys.stdin)
-          print(list(d['tags'].values())[0]['digest'])")
+          print(d['tags'][0])")
           repo=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
           token=$(curl -sSf \
             "https://${REGISTRY}/token?scope=repository:${repo}:pull" \
@@ -93,7 +94,7 @@ jobs:
           curl -sSf -H "Authorization: Bearer ${token}" \
             -H 'Accept: application/vnd.oci.image.index.v1+json' \
             -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://${REGISTRY}/v2/${repo}/manifests/${digest}" > /tmp/m.json
+            "https://${REGISTRY}/v2/${repo}/manifests/${image}" > /tmp/m.json
           python3 -c "
           import json
           d = json.load(open('/tmp/m.json'))
