@@ -559,8 +559,8 @@ compose 默认带了 `cap_drop: ALL` 和 `no-new-privileges` —— 这台服务
 ```
 ts=2026-10-11T13:38:57.412+08:00 lvl=INFO provider=gitea delivery=b1f4c9e2…
 repo=acme/webhook2nats number=134 kind=issue_comment actor=zhangsan
-mentions=[alice wuming] subjects=[evt.gitea.notify.h1.alice]
-status=200 decision=accepted dur_ms=1.2 peer=10.0.0.9 msg="请求处理完成"
+mentions=[alice wendy] subjects=[evt.gitea.notify.h1.alice]
+status=200 decision=accepted dur_ms=1.2 peer=192.0.2.9 msg="请求处理完成"
 ```
 
 ### 按 delivery 把日志和门铃对上号
@@ -588,10 +588,10 @@ NATS 消息里 —— Agent 已经持有了，日志再记一遍**不增加任�
 典型现场：某人被 @ 了但没收到门铃。日志里看这两行的差异就够了：
 
 ```
-mentions=[alice wuming] subjects=[evt.gitea.notify.h1.alice]
+mentions=[alice wendy] subjects=[evt.gitea.notify.h1.alice]
 ```
 
-`mentions` 里有 `wuming`，但 `subjects` 里没有他 —— **`wuming` 不在 `members.json` 里**。
+`mentions` 里有 `wendy`，但 `subjects` 里没有他 —— **`wendy` 不在 `members.json` 里**。
 正文记不记都无所谓，元数据已经给出答案。
 
 ### 输出与轮转

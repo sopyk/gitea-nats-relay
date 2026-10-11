@@ -6,6 +6,7 @@
 
 运行：python3 test_internals.py
 """
+import glob
 import os
 import re
 import sys
@@ -55,8 +56,8 @@ class MentionTest(unittest.TestCase):
                              f"漏匹配: {text!r}")
 
     def test_code_is_stripped(self):
-        text = "请 @bob 看，`@amy` 是代码，```\n@zhuazhua\n```\n再 @mayaoyao"
-        self.assertEqual(providers_mod.extract_mentions(text), ["bob", "mayaoyao"])
+        text = "请 @bob 看，`@amy` 是代码，```\n@zack\n```\n再 @carol"
+        self.assertEqual(providers_mod.extract_mentions(text), ["bob", "carol"])
 
     def test_emails_are_not_mentions(self):
         self.assertEqual(providers_mod.extract_mentions("联系 user@example.com"), [])
@@ -106,22 +107,25 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(ev["actor"], "you")
         self.assertEqual(ev["number"], 134)
         self.assertEqual(ev["state"], "open")
-        self.assertEqual(ev["assignees"], ["mayaoyao"])
+        self.assertEqual(ev["assignees"], ["carol"])
         self.assertEqual(ev["labels"], ["bug"])
         self.assertIn("#issuecomment-42", ev["comment_url"])
-        self.assertEqual(ev["mentions"], ["madeng", "mayaoyao"])
+        # mentions 是 **sorted** 的（normalize 里 sorted(set(api) | set(正文抽的))），
+        # 所以断言必须按字母序写。看着像「正文里出现顺序」的写法，
+        # 只要换成任何一对顺序相反的名字就会假失败，而测试本身看不出在测排序。
+        self.assertEqual(ev["mentions"], ["carol", "dave"])
 
     def test_review_reads_content_not_body(self):
         """Gitea ReviewPayload 是 {"type","content"}。旧代码读 body → 提及全丢。"""
         ev = self.norm(fixtures.review_approved(), "review")
         self.assertEqual(ev["review_state"], "pull_request_review_approved")
-        self.assertEqual(ev["mentions"], ["mayaoyao"])
+        self.assertEqual(ev["mentions"], ["carol"])
         self.assertEqual(ev["kind"], "review")
 
     def test_review_rejected_and_comment(self):
         ev = self.norm(fixtures.review_rejected(), "review")
         self.assertEqual(ev["review_state"], "pull_request_review_rejected")
-        self.assertEqual(ev["mentions"], ["madeng"])
+        self.assertEqual(ev["mentions"], ["dave"])
 
         ev = self.norm(fixtures.review_comment(), "review")
         self.assertEqual(ev["review_state"], "pull_request_review_comment")
@@ -130,19 +134,19 @@ class NormalizeTest(unittest.TestCase):
 
     def test_reviewers_from_pull_request(self):
         ev = self.norm(fixtures.pull_request_event(), "pull_request")
-        self.assertEqual(ev["reviewers"], ["madeng"])
+        self.assertEqual(ev["reviewers"], ["dave"])
 
     def test_requested_reviewer_singular_is_captured(self):
         """review_requested 时真正被请求的人在顶层单数字段里，PR 上是空的。"""
-        ev = self.norm(fixtures.review_requested("madeng"), "review")
-        self.assertEqual(ev["reviewers"], ["madeng"])
+        ev = self.norm(fixtures.review_requested("dave"), "review")
+        self.assertEqual(ev["reviewers"], ["dave"])
 
     def test_requested_reviewer_deduped(self):
         """同时出现在单数和复数里也不该重复。"""
-        p = fixtures.review_requested("madeng")
-        p["pull_request"]["requested_reviewers"] = [{"login": "madeng"}]
+        p = fixtures.review_requested("dave")
+        p["pull_request"]["requested_reviewers"] = [{"login": "dave"}]
         ev = self.norm(p, "review")
-        self.assertEqual(ev["reviewers"], ["madeng"])
+        self.assertEqual(ev["reviewers"], ["dave"])
 
     def test_is_pr_flagged_for_pr_comment(self):
         ev = self.norm(fixtures.issue_comment(is_pull=True), "issue_comment")
@@ -895,43 +899,151 @@ class RoutingTest(unittest.TestCase):
 
     def test_broadcast_authors_only(self):
         self.assertTrue(core.is_broadcast(
-            {"kind": "issue", "action": "opened", "actor": "mayaoyao",
-             "title": "【公告】上线", "labels": []}, {"mayaoyao"}))
+            {"kind": "issue", "action": "opened", "actor": "carol",
+             "title": "【公告】上线", "labels": []}, {"carol"}))
         self.assertTrue(core.is_broadcast(
-            {"kind": "issue", "action": "opened", "actor": "mayaoyao",
-             "title": "普通标题", "labels": [{"name": "公告"}]}, {"mayaoyao"}))
+            {"kind": "issue", "action": "opened", "actor": "carol",
+             "title": "普通标题", "labels": [{"name": "公告"}]}, {"carol"}))
         self.assertFalse(core.is_broadcast(
             {"kind": "issue", "action": "opened", "actor": "someone",
-             "title": "【公告】上线", "labels": []}, {"mayaoyao"}))
+             "title": "【公告】上线", "labels": []}, {"carol"}))
         self.assertFalse(core.is_broadcast(
-            {"kind": "issue_comment", "action": "created", "actor": "mayaoyao",
-             "title": "【公告】", "labels": []}, {"mayaoyao"}))
+            {"kind": "issue_comment", "action": "created", "actor": "carol",
+             "title": "【公告】", "labels": []}, {"carol"}))
 
     def test_targets_are_deterministic(self):
         """排序后结果稳定 —— 同样的事件每次发出的 subject 顺序必须一致，
         否则排查问题时对不上日志。"""
-        ev = {"assignees": ["zoe", "alice"], "mentions": ["madeng", "bob"]}
+        ev = {"assignees": ["zoe", "alice"], "mentions": ["dave", "bob"]}
         runs = {tuple(core.extract_targets(ev, self.members)) for _ in range(20)}
         self.assertEqual(len(runs), 1, f"顺序不稳定: {runs}")
 
-    def test_no_default_authors_in_code(self):
-        """代码里不得内置任何具体账号 —— 扫全部产品模块，不只是 core。"""
-        import glob
-        import inspect
-        here = os.path.dirname(os.path.abspath(__file__))
+    # 这些是本项目曾经用过的**真实同事 Gitea 登录名**。已经全库换成
+    # carol / dave / wendy / zack / zoe / alice / bob 这类明显的占位名。
+    #
+    # ⚠️ 这个列表有个真实的弱点：它是**字面量**。将来有人做全局重命名（比如
+    # `sed -i 's/carol/X/g'`），会连同这份名单一起改掉，守卫就静默失效了
+    # —— 而测试照样全绿。所以下面配了一条「名单本身没被改动」的自检。
+    BANNED_LOGINS = ("mayaoyao", "madeng", "wuming", "zhuazhua")
+
+    def _repo_files(self):
+        """全库受管文件 —— 不只是 relay/ 下的 .py。
+
+        原来的版本只扫产品代码，故意放过 fixtures.py 和 test_*.py
+        （理由是「注释里提到成员名不算」）。但人名恰恰全在那些文件里 ——
+        守卫扫了个寂寞。现��� README 和配置模板一并纳入：文档里的例子
+        和 fixture 一样会进公开仓库。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out = []
+        for sub in ("relay", "config", ".github"):
+            d = os.path.join(root, sub)
+            for path in glob.glob(os.path.join(d, "**", "*"), recursive=True):
+                if os.path.isfile(path) and path.endswith(
+                        (".py", ".md", ".toml", ".yml", ".yaml", ".example")):
+                    out.append(path)
+        for name in ("README.md", "relay.env.example", "test_deploy.py"):
+            p = os.path.join(root, name)
+            if os.path.isfile(p):
+                out.append(p)
+        return out
+
+    def test_no_real_member_logins_anywhere(self):
+        """全库不得出现具体登录名 —— 包括 fixture、测试和文档。"""
+        # 必须跳过本文件：黑名单字面量就在这里，自举问题。
+        # 这也是唯一一个合理的例外 —— 别顺手把它扩大成「跳过所有测试文件」，
+        # 那样就回到了「扫了个寂寞」的老问题。
+        self_path = os.path.abspath(__file__)
         offenders = []
-        for path in glob.glob(os.path.join(here, "*.py")):
-            base = os.path.basename(path)
-            if base.startswith("test_") or base == "fixtures.py":
+        for path in self._repo_files():
+            if os.path.abspath(path) == self_path:
                 continue
+            rel = os.path.relpath(path, os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))
             with open(path, encoding="utf-8") as f:
-                src = f.read()
-            # 只看代码部分：docstring/注释里提到成员名不算
-            for line in src.splitlines():
-                code = line.split("#", 1)[0]
-                if any(n in code for n in ("mayaoyao", "madeng", "zhuazhua", "sopyk")):
-                    offenders.append(f"{base}: {line.strip()[:70]}")
-        self.assertEqual(offenders, [], f"产品代码里出现了具体登录名: {offenders}")
+                for i, line in enumerate(f, 1):
+                    if any(n in line for n in self.BANNED_LOGINS):
+                        offenders.append(f"{rel}:{i}: {line.strip()[:70]}")
+        self.assertEqual(offenders, [],
+                         f"公开仓库里出现了真实登录名: {offenders}")
+
+    def test_the_denylist_itself_was_not_scrubbed(self):
+        """反向自检：黑名单被顺手改掉时必须失败。
+
+        没有这条，一次 `sed -i 's/mayaoyao/carol/g'` 就会把黑名单一起改掉，
+        守卫从此什么都不查，而**所有测试依然全绿**。这类「护栏本身失效」
+        的事已经发生过一次（第一次扫描就放过了 fixtures），不能再犯。
+        """
+        src = os.path.abspath(__file__)
+        with open(src, encoding="utf-8") as f:
+            body = f.read()
+        for name in self.BANNED_LOGINS:
+            self.assertIn(f'"{name}"', body,
+                          f"黑名单里的 {name!r} 在源码里找不到了 —— "
+                          f"有人重命名时把守卫本身也改掉了")
+        # 这几个占位名是「允许出现」的，断言它们确实在用（否则黑名单形同虚设）
+        with open(os.path.join(os.path.dirname(src), "fixtures.py"),
+                  encoding="utf-8") as f:
+            self.assertIn("carol", f.read(),
+                          "占位名没在 fixture 里，说明改名可能没做干净")
+
+    def test_no_credentials_or_local_paths(self):
+        """凭据、本机路径、内网地址 —— 这类不需要名单，靠模式识别。"""
+        # 本文件同样跳过：下面的自检里会**故意**写出 `/home/...` 这类样例。
+        self_path = os.path.abspath(__file__)
+        patterns = [
+            (r"/home/[a-z][a-z0-9_-]*/", "本机家目录路径"),
+            (r"/Users/[A-Za-z][A-Za-z0-9_-]*/", "macOS 用户目录"),
+            (r"\bghp_[A-Za-z0-9]{20,}", "GitHub token"),
+            (r"\bgithub_pat_[A-Za-z0-9_]{20,}", "GitHub fine-grained token"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "AWS access key"),
+            (r"-----BEGIN [A-Z ]*PRIVATE KEY", "私钥"),
+            (r"\b10\.\d+\.\d+\.\d+\b", "内网地址"),
+            (r"\b192\.168\.\d+\.\d+\b", "内网地址"),
+            (r"\b172\.(1[6-9]|2\d|3[01])\.\d+\.\d+\b", "内网地址"),
+        ]
+        offenders = []
+        for path in self._repo_files():
+            if os.path.abspath(path) == self_path:
+                continue
+            rel = os.path.relpath(path, os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))))
+            with open(path, encoding="utf-8") as f:
+                for i, line in enumerate(f, 1):
+                    for pat, why in patterns:
+                        if re.search(pat, line):
+                            offenders.append(
+                                f"{rel}:{i}: {why} → {line.strip()[:60]}")
+        self.assertEqual(offenders, [],
+                         f"仓库里混进了不该有的东西: {offenders}")
+
+    def test_only_example_templates_are_tracked(self):
+        """真实配置与密钥文件绝不能进库，只允许 .example。
+
+        这条盯的是 gitignore 而不是文件内容：即便有人 git add -f 了
+        relay.env，内容扫描也未必看得出问题，而文件名本身就是信号。
+        """
+        import subprocess
+        try:
+            tracked = subprocess.run(
+                ["git", "ls-files"], capture_output=True, text=True,
+                timeout=30, cwd=os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))))
+            files = set(tracked.stdout.split())
+        except (subprocess.SubprocessError, OSError):
+            self.skipTest("拿不到 git ls-files")
+        for name in files:
+            base = os.path.basename(name)
+            self.assertNotEqual(base, "relay.env",
+                                f"真实密钥文件被提交了: {name}")
+            self.assertNotEqual(base, "members.json",
+                                f"真实成员映射被提交了: {name}")
+            self.assertNotEqual(base, "webhook2nats.toml",
+                                f"真实配置被提交了: {name}")
+            self.assertNotEqual(base, "seen.json",
+                                f"去重状态文件被提交了: {name}")
+            if name.endswith((".log", ".json")) and ".example" not in name:
+                self.fail(f"不该进库的运行产物: {name}")
 
 
 class SeenTest(unittest.TestCase):
@@ -989,7 +1101,7 @@ password = "p"
 members_file = "{members}"
 notify_subject_prefix = "evt.gitea.notify"
 broadcast_subject = "evt.gitea.broadcast"
-broadcast_authors = ["mayaoyao"]
+broadcast_authors = ["carol"]
 [providers.gitea]
 path = "/gitea-hook"
 [providers.gitea.headers]
@@ -1010,7 +1122,7 @@ issue_comment = "issue_comment"
         with open(m, "w", encoding="utf-8") as f:
             json.dump({"members": {
                 "alice": {"host": "h1", "id": "alice"},
-                "madeng": {"host": "h2", "id": "madeng"},
+                "dave": {"host": "h2", "id": "dave"},
             }}, f)
         p = os.path.join(d, "c.toml")
         with open(p, "w", encoding="utf-8") as f:
@@ -1030,12 +1142,12 @@ issue_comment = "issue_comment"
                          ["acme.poke.h1.alice"])
 
     def test_broadcast_subject_added_for_announcement(self):
-        ev = {"kind": "issue", "action": "opened", "actor": "mayaoyao",
+        ev = {"kind": "issue", "action": "opened", "actor": "carol",
               "title": "【公告】上线", "labels": []}
         self.assertEqual(self.relay.subjects_for(ev), ["evt.gitea.broadcast"])
 
     def test_broadcast_and_notify_combined(self):
-        ev = {"kind": "issue", "action": "opened", "actor": "mayaoyao",
+        ev = {"kind": "issue", "action": "opened", "actor": "carol",
               "title": "【公告】上线", "labels": [], "assignees": ["alice"]}
         self.assertEqual(sorted(self.relay.subjects_for(ev)),
                          ["evt.gitea.broadcast", "evt.gitea.notify.h1.alice"])
@@ -1049,9 +1161,9 @@ issue_comment = "issue_comment"
         self.assertEqual(self.relay.subjects_for({"mentions": ["nobody"]}), [])
 
     def test_reviewers_and_assignees_both_routed(self):
-        ev = {"assignees": ["alice"], "reviewers": ["madeng"]}
+        ev = {"assignees": ["alice"], "reviewers": ["dave"]}
         self.assertEqual(sorted(self.relay.subjects_for(ev)),
-                         ["evt.gitea.notify.h1.alice", "evt.gitea.notify.h2.madeng"])
+                         ["evt.gitea.notify.h1.alice", "evt.gitea.notify.h2.dave"])
 
     def test_same_recipient_not_published_twice(self):
         ev = {"assignees": ["alice"], "mentions": ["alice"], "reviewers": ["alice"]}
