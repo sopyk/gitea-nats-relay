@@ -47,12 +47,41 @@ DEFAULT_BACKUPS = 5
 # 一个超长字符串撑爆，也不该因为它被截断而丢掉整行。
 MAX_VALUE_CHARS = 200
 
-# 永远不进日志的字段名（不区分大小写）。payload 的正文没有列进来是因为
-# 它压根不会被 server.py 传过来；这里是第二道防线。
-_FORBIDDEN_FIELDS = frozenset({
-    "body", "comment_body", "review_content", "payload",
-    "secret", "signature", "password", "authorization",
-})
+# log_bodies 逃生开关下 body 字段的单独上限。
+#
+# 必须比上面大得多：payload 的 JSON 头部（action/repo/sender…）通常就先
+# 吃掉前 200 字符，真正要排查的 comment.body 根本轮不到。用普通上限的话
+# 这个开关等于白开 —— 实测过，200 字符截断正好切在 issue 对象中间。
+#
+# 8000 足够看清任何真实场景下的评论正文，又有明确上界。
+MAX_BODY_CHARS = 8000
+
+_BODY_FIELD_NAMES = frozenset({"body", "comment_body", "review_content"})
+
+# 永远不进日志的字段名（不区分大小写）。这些**没有开关** ——
+# 密钥类的东西没有任何排查场景需要它们，放行等于把事故写进磁盘。
+#
+# 按**子串**匹配而不是精确匹配：`webhook_secret` / `authorization_header`
+# / `db_password` 这些变体同样必须拦住。精确匹配的话，只要将来有人写了
+# 一个 `webhook_secret=...` 字段名就绕过了。
+_FORBIDDEN_TOKENS = (
+    "secret", "password", "passwd", "authorization", "credential",
+    "token", "signature", "apikey", "api_key",
+)
+
+# 默认也不记，但 `log_bodies = true` 时放行的字段。**精确匹配** ——
+# 这些词太通用，按子串拦会误伤我们合法要记的字段。
+#
+# 放在这里而不是跟密钥类混在一起，是为了让「开关真的有效」这件事
+# 只取决于一个地方 —— 之前把 body 放进密钥黑名单当纵深防御，结果逃生
+# 开关被自己废了：配置能写、文档写了，实际永远不生效。
+_BODY_FIELDS = frozenset({"body", "comment_body", "review_content",
+                          "payload", "raw_payload", "raw_body"})
+
+# 由 setup() 设置的逃生开关状态。进程级是合适的 —— 日志配置本来就是
+# 进程级的，而且它必须同时影响 event() 和两个 Formatter，两边读同一个
+# 值才不会出现「一边放行一边拦住」的不一致。
+_ALLOW_BODIES = False
 
 # 不加引号的安全字符集。其余一律加引号并转义 —— subject 里可能有空格
 # 之外的怪字符，而日志是要给人 grep 的，歧义比难读更糟。
@@ -77,7 +106,7 @@ class LogConfig:
         self.log_bodies = log_bodies
 
 
-def _format_value(value):
+def _format_value(value, key=None):
     if value is None:
         return "-"
     if isinstance(value, bool):
@@ -86,25 +115,84 @@ def _format_value(value):
         return str(value)
     if isinstance(value, (list, tuple, set, frozenset)):
         items = sorted(value) if isinstance(value, (set, frozenset)) else list(value)
-        return "[" + " ".join(_format_value(v) for v in items) + "]"
+        return "[" + " ".join(_format_value(v, key) for v in items) + "]"
     text = str(value)
-    if len(text) > MAX_VALUE_CHARS:
-        text = text[:MAX_VALUE_CHARS] + "…"
+    limit = MAX_BODY_CHARS if (key or "").lower() in _BODY_FIELD_NAMES else MAX_VALUE_CHARS
+    if len(text) > limit:
+        # 标出被截掉了多少，否则读日志的人会以为这就是全部，
+        # 基于截断内容下结论（比如「正文里没有 @alice」）是危险的。
+        text = text[:limit] + f"…(已截断，共 {len(text)} 字符)"
     return text if _SAFE_TOKEN.match(text) else _quote(text)
 
 
 def _quote(text):
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """把值包进双引号，并转义掉会破坏「一行一条」的东西。
+
+    只转义反斜杠和引号是不够的：值里一个裸换行就能让一条日志裂成两行，
+    第二行可以长得和别的日志一模一样 —— 也就是**伪造日志**。攻击者
+    控制得了的字段（delivery 头、error=repr(e)、log_bodies 打开时的
+    正文）都能做到，所以这里统一按 C 风格转义所有控制字符。
+
+    ESC（\\x1b）也要转：它能让终端改颜色、清屏、伪造提示符，
+    在看 docker logs 的终端上就是实打实的操纵。
+    """
+    out = []
+    for ch in text:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
-def safe_fields(fields):
+def _is_forbidden(name, allow_bodies):
+    """字段名是否属于禁止的那一类。
+
+    密钥类按**子串**判：键名是代码写死的、攻击者控不了键只能控值，但
+    防的是「将来有人加了 `_mark(webhook_secret=...)`」这种迟早会发生
+    的事。按子串能一次覆盖所有变体。
+
+    正文类按**精确**判：body/comment/payload 这类词太通用，按子串会
+    误伤 `comment_url` —— 而那是我们**刻意**要记的字段（它跟其它元数据
+    一样已经发给 Agent，不增加暴露面）。
+    """
+    lowered = name.lower()
+    if any(tok in lowered for tok in _FORBIDDEN_TOKENS):
+        return True
+    return not allow_bodies and lowered in _BODY_FIELDS
+
+
+def safe_fields(fields, allow_bodies=None):
     """剥掉禁止字段。
 
-    `log_bodies` 为真时**仍然不放行 body** —— 逃生开关是分开的、更显式的
-    那个（见 server.py 里调用点），这样即使这里被误传也不会漏出去。
+    **纯函数**：`allow_bodies` 只影响本次调用，绝不改全局。
+    （第一版把它写成了会写全局，于是「先调一次 allow_bodies=True」
+    之后整个进程都放行了正文 —— 而它本该是配置决定的、一次性的事。
+    进程级状态只由 setup() 改。）
+
+    密钥类字段**永远**剥掉，没有任何开关。
+
+    正文类字段（body 等）默认剥掉，只有 `log_bodies = true` 才放行 ——
+    那是一个显式的、需要用户主动去配的逃生开关，存在的唯一理由是
+    「正文里明明有 @alice 但正则没抽到」，那种情形消息和日志的
+    mentions 会同时为空，光看元数据区分不出来。
+
+    注意放行正文**不等于**放弃防注入：值仍然经过 _quote 的控制字符
+    转义，正文里的换行只会变成字面量 \\n，不会把日志劈成两行。
     """
-    return {k: v for k, v in fields.items()
-            if k.lower() not in _FORBIDDEN_FIELDS}
+    if allow_bodies is None:
+        allow_bodies = _ALLOW_BODIES
+    return {k: v for k, v in fields.items() if not _is_forbidden(k, allow_bodies)}
 
 
 class TextFormatter(logging.Formatter):
@@ -113,6 +201,11 @@ class TextFormatter(logging.Formatter):
     刻意**不做**成 Prometheus 的花括号语法 —— 日志行是人在群晖的
     `docker logs` 里看的。`status=200` 和 `status="200"` 一样好 grep，
     没必要为此牺牲可读性。
+
+    堆栈**必须**在这里输出。text 是默认格式，而这个类之前漏掉了
+    exc_info —— 未预期异常只留下一行 `msg="未处理的异常"`，没有任何
+    堆栈，恰好在最需要堆栈的时候什么都看不到。堆栈按 C 风格转义成一行
+    内的字面量，保证「一条日志一行」不被破坏。
     """
 
     def format(self, record):
@@ -121,10 +214,18 @@ class TextFormatter(logging.Formatter):
         parts = [f"ts={ts}", f"lvl={record.levelname}"]
         fields = safe_fields(getattr(record, "relay_fields", None) or {})
         if fields:
-            parts.extend(f"{k}={_format_value(v)}" for k, v in fields.items())
+            parts.extend(f"{k}={_format_value(v, k)}" for k, v in fields.items())
         if record.getMessage():
             parts.append(f"msg={_quote(record.getMessage())}")
-        return " ".join(parts)
+        line = " ".join(parts)
+        if record.exc_info:
+            trace = self.formatException(record.exc_info).strip()
+            # exc_info=True 但当前没有活动异常时，formatException 返回
+            # 字面量 "NoneType: None"。把它写进日志只会让人以为真出了
+            # 一个 NoneType 的错 —— 噪音比没有更糟。
+            if trace and trace != "NoneType: None":
+                line += f" exc={_quote(trace)}"
+        return line
 
 
 class JsonFormatter(logging.Formatter):
@@ -175,6 +276,7 @@ def setup(cfg, stream=None):
 
     返回一句警告文本（成功则为空串），供调用方决定怎么报。
     """
+    global _ALLOW_BODIES
     logger = get_logger()
     level = getattr(logging, str(cfg.level).upper(), logging.INFO)
     if not isinstance(level, int):
@@ -182,6 +284,7 @@ def setup(cfg, stream=None):
     logger.setLevel(level)
     # 本模块自己的 logger 不往 root 传，否则 stdout 会重复打一遍。
     logger.propagate = False
+    _ALLOW_BODIES = bool(cfg.log_bodies)
     # setup 可能被重复调用（测试里尤其），先清掉上一轮留下的 handler。
     for h in list(logger.handlers):
         logger.removeHandler(h)
