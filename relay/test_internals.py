@@ -569,8 +569,11 @@ class LogConfigTest(unittest.TestCase):
         测试真的去写一遍 [logging] 的每一个键。留着这样的键意味着
         文档写了、校验放行了，实际却不生效。
         """
-        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "config.py"), encoding="utf-8").read()
+        # 用 with 关掉句柄：不关的话解释器退出时会抛 ResourceWarning，
+        # 平时被淹没在输出里，但它是真的漏了（-W error::ResourceWarning 能逼出来）。
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "config.py"), encoding="utf-8") as fh:
+            src = fh.read()
         body = src[src.index("VALID_LOGGING = "):]
         body = body[:body.index(")") + 1]
         declared = set(re.findall(r'"([a-z_]+)"', body))

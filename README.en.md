@@ -55,9 +55,9 @@ mostly empty requests, with latency bounded by the polling interval.
 
 ```
    Before                                  After
-┌────────────┐           ┌────────────┐    ┌────────────┐           ┌──────────────┐           ┌────────────┐           ┌────────────┐
-│   Agent    │           │   Gitea    │    │  platform  │           │ Webhook2NATS │           │    NATS    │           │   Agent    │
-└────────────┘           └────────────┘    └────────────┘           └──────────────┘           └────────────┘           └────────────┘
+┌────────────┐  poll     ┌────────────┐    ┌────────────┐ webhook   ┌──────────────┐ bell      ┌────────────┐ publish   ┌────────────┐
+│   Agent    │ ------>   │   Gitea    │    │  platform  │ ------>   │ Webhook2NATS │ ----->    │    NATS    │ ----->    │   Agent    │
+└────────────┘ minutes   └────────────┘    └────────────┘ ms        └──────────────┘ instant   └────────────┘ instant   └────────────┘
   latency <= one poll cycle                              latency <= one round trip
   most requests are empty                                                    zero empty requests
 ```
@@ -210,5 +210,5 @@ python3 test_logs.py          # logging: degradation, privacy, rate limits, rota
 python3 test_e2e.py           # simulation: keep-alive / injection / concurrency / real NATS
 ```
 
-**272 tests**, none of which need real NATS or internet (`test_e2e.py` spins up
+**274 tests**, none of which need real NATS or internet (`test_e2e.py` spins up
 its own container). See the [testing notes](docs/operations.md#测试).

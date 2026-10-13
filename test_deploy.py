@@ -697,6 +697,49 @@ class LocalizedDocsTest(unittest.TestCase):
                     f"{path} 的流程图里没有独立的 {node} 框（实际有 {boxes}）—— "
                     f"少了它，读者会以为 relay 直连 Agent，而绕过了 NATS")
 
+    def test_flow_diagram_has_arrows_between_every_hop(self):
+        """每一跳都必须有箭头。
+
+        这条是被真错抓出来的：生成脚本把间隙文字和框内容写在**同一列**，
+        框后写，把箭头整个盖掉了。图看着还挺整齐、三行等宽，于是
+        「有没有箭头」没有任何断言在看 —— 三行都只剩空框，完全不传达
+        「数据往哪流」。
+
+        做法不是数箭头总数：图是「改之前 / 改之后」**两组并排**，不是一条
+        链，所以「框数 - 1」不成立。改为按**列位置**找出每个间隙 —— 标准
+        间隙（组内的一跳）必须含箭头；组与组之间那个更宽的分隔间隙不要求。
+        这样中英两版、不同空格数都不用硬编码。
+        """
+        import unicodedata
+
+        def disp_width(s):
+            return sum(0 if unicodedata.combining(c) else
+                       (2 if unicodedata.east_asian_width(c) in "WF" else 1)
+                       for c in s)
+
+        for path in ("README.md", self.README_EN):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                text = f.read()
+            diagram = _find_box_diagram(text)
+            self.assertIsNotNone(diagram, f"{path} 里找不到框线图")
+            mid = next((l for l in diagram.split("\n") if l.startswith("│")),
+                       None)
+            self.assertIsNotNone(mid, f"{path} 的图没有中间内容行")
+            spans = [(m.start(), m.end()) for m in re.finditer(r"│[^│]*│", mid)]
+            self.assertGreaterEqual(len(spans), 2, f"{path} 的图框太少")
+
+            gaps = [mid[e0:s1] for (_s0, e0), (s1, _e1) in zip(spans, spans[1:])]
+            # 不变式：**最多只有一个间隙可以没有箭头** —— 那一个是「改之前 /
+            # 改之后」两组之间的分隔。两个半图组内每一跳都必须画箭头。
+            #
+            # 刻意不比宽度：组内间隙和分隔间隙谁宽谁窄在不同文件里不一样
+            # （中文版分隔更窄、英文版更宽），第一版用 min() 判定正好判反了。
+            empty = [g for g in gaps if not re.search(r"▶|-+>", g)]
+            self.assertLessEqual(
+                len(empty), 1,
+                f"{path} 的图里有 {len(empty)} 处间隙没有箭头（最多允许 1 处，"
+                f"即两组之间的分隔）：{empty} —— 数据流向没画出来")
+
     def test_flow_diagram_is_aligned(self):
         """框线图的三行显示宽度必须一致，否则在等宽终端里是歪的。
 
@@ -772,11 +815,57 @@ class LocalizedDocsTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(ROOT, link)),
                             f"{link} 是英文 README 里指向但不存在的文件")
 
-    def test_both_readmes_agree_on_test_count(self):
-        """测试条数两边一致 —— 不一致说明有一边忘了更新。
+    def test_readme_test_count_matches_reality(self):
+        """README 写的测试条数必须**等于真实跑出来的条数**。
 
-        不写死具体数字，只要求两份里出现的数字相同。
+        第一版只断言「中英两份写的数字相同」。那是不够的 —— 两份一起过期
+        照样绿。加了测试而忘了改 README 时，这个数字就是个没人更新的
+        旧数字，正是「同一个数出现在多处、有的更新有的没更新」那类坑。
+
+        刻意**用 unittest 自己的 loader 数**，而不是数源码里的 `def test_`：
+
+        - loader 的口径和 `python3 -m unittest` 报出来的一致，不会两套标准；
+        - `relay/test_e2e.py` 里有 22 条是**动态生成**的（按事件类型循环
+          造出来的），数 `def test_` 会少算 22 条 —— 我第一版就是这么写的，
+          数出 251 而实际是 273。
+
+        只导入模块、不执行用例，所以不碰 Docker、不连 NATS，跑起来是瞬时的。
         """
+        import unittest
+
+        modules = ("test_deploy", "test_internals", "test_relay",
+                   "test_logs", "test_e2e")
+        loader = unittest.TestLoader()
+        per_module = {}
+        for name in modules:
+            if name in sys.modules:
+                # 当前模块自己就在里面 —— 千万别 pop 掉再 import：
+                # 那等于把正在运行的模块换掉，后面谁 import 到它就拿到另一个
+                # 实例（第一版就这么写的，冒出一个 ResourceWarning）。
+                mod = sys.modules[name]
+            else:
+                saved = list(sys.path)
+                sys.path.insert(0, os.path.join(ROOT, "relay"))
+                try:
+                    mod = importlib.import_module(name)
+                finally:
+                    sys.path[:] = saved
+            per_module[name] = loader.loadTestsFromModule(mod).countTestCases()
+        actual = sum(per_module.values())
+
+        pat = re.compile(r"\*\*(\d+) 条\*\*|\*\*(\d+) tests\*\*")
+        for path in ("README.md", self.README_EN):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                m = pat.search(f.read())
+            self.assertIsNotNone(m, f"{path} 里没写测试条数")
+            stated = int(m.group(1) or m.group(2))
+            self.assertEqual(
+                stated, actual,
+                f"{path} 写的测试条数是 {stated}，实际是 {actual}"
+                f"（各套：{per_module}）—— 加了测试就要改这个数字")
+
+    def test_both_readmes_agree_on_test_count(self):
+        """两份 README 写的测试条数必须相同。"""
         pat = re.compile(r"\*\*(\d+) 条\*\*|\*\*(\d+) tests\*\*")
         def count_of(path):
             with open(os.path.join(ROOT, path), encoding="utf-8") as f:
