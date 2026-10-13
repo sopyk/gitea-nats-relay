@@ -641,6 +641,188 @@ class VersionConsistencyTest(unittest.TestCase):
                       "逻辑 tag 会重复出现，拍平就分不清谁是谁")
 
 
+def _find_box_diagram(text):
+    """从 markdown 里取出用框线画的那段图。
+
+    围栏正则**必须**吃掉语言标记（```bash / ```json）。写成 `` ```\n `` 的话
+    它会从上一个代码块的**结束**围栏一路吃到下一个块的开始 —— 匹配到的
+    东西横跨两个块，自然找不到框线图。这条就是这么空转了一次。
+    """
+    blocks = re.findall(r"```[^\n]*\n(.*?)```", text, re.S)
+    return next((b for b in blocks if "─" in b and "│" in b), None)
+
+
+class LocalizedDocsTest(unittest.TestCase):
+    """中英两份文档必须事实一致、能互相找到、并且都保持可用。
+
+    背景：为了让人在 Docker Hub / GitHub 上看得懂，加了英文版。但这是
+    一个**漂移源** —— 三处会漂的地方：
+
+    1. 两边的镜像仓库路径不一致，别人照英文版 pull 会失败
+    2. 两边的测试条数 / 文档清单不一致，说明有一边忘了更新
+    3. 版本号写死成了字面量，下个版本就变成旧数字
+
+    所以这里把「两份文档对得上」变成每次跑测试都验的事。
+    """
+
+    README_EN = "README.en.md"
+    CHANGELOG_EN = "CHANGELOG.en.md"
+
+    def test_flow_diagram_shows_nats(self):
+        """「改之前 / 改之后」那张图必须画出 NATS 这一跳。
+
+        这条是被真错抓出来的：图上只画了 平台 → Webhook2NATS → Agent，
+        **中间的 NATS 框不见了**。读的人会以为 relay 直连 Agent 去推消息
+        —— 而这个项目的核心恰恰是「发布到 NATS，由订阅者取」。少了那一框，
+        架构就讲错了，而且图看着还挺整齐，不容易发现。
+
+        断言方式刻意不查「图里有几个框」（太脆），只查**关键组件都在**：
+        平台、Webhook2NATS、NATS、Agent 四者必须同时出现。
+        """
+        for path in ("README.md", self.README_EN):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                text = f.read()
+            # 取包含 ASCII 框线的那段代码块
+            diagram = _find_box_diagram(text)
+            self.assertIsNotNone(diagram, f"{path} 里找不到框线图")
+
+            # 必须**解析出每个框的内容**再比对，不能直接搜子串：
+            # "NATS" 是 "Webhook2NATS" 的子串，删掉 NATS 那一框之后
+            # `"NATS" in diagram` 依然为真 —— 第一版就是这么写的，
+            # 于是你报出来的那个错，测试完全没反应。
+            boxes = [c.strip() for c in re.findall(r"│([^│]*)│", diagram)]
+            for node in ("Webhook2NATS", "NATS", "Agent"):
+                self.assertIn(
+                    node, boxes,
+                    f"{path} 的流程图里没有独立的 {node} 框（实际有 {boxes}）—— "
+                    f"少了它，读者会以为 relay 直连 Agent，而绕过了 NATS")
+
+    def test_flow_diagram_is_aligned(self):
+        """框线图的三行显示宽度必须一致，否则在等宽终端里是歪的。
+
+        CJK 是双宽字符，肉眼很难判断对齐 —— 这条把「看起来齐」变成
+        「按显示宽度算确实齐」。写这个图时靠肉眼对错过一次。
+        """
+        import unicodedata
+
+        def disp_width(s):
+            return sum(0 if unicodedata.combining(c) else
+                       (2 if unicodedata.east_asian_width(c) in "WF" else 1)
+                       for c in s)
+
+        for path in ("README.md", self.README_EN):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                text = f.read()
+            diagram = _find_box_diagram(text)
+            self.assertIsNotNone(diagram, f"{path} 里找不到框线图")
+            lines = diagram.split("\n")
+            # 三行框（上下边框 + 中间内容行）必须等宽
+            box_rows = [l for l in lines if l.startswith(("┌", "│", "└"))]
+            self.assertGreaterEqual(len(box_rows), 3, f"{path} 的图不完整")
+            widths = {disp_width(l) for l in box_rows[:3]}
+            self.assertEqual(
+                len(widths), 1,
+                f"{path} 的图三行显示宽度不等 {sorted(widths)} —— "
+                f"CJK 是双宽字符，等宽终端里会歪")
+
+    def test_both_readmes_exist_and_cross_link(self):
+        for zh, en in (("README.md", self.README_EN),
+                       ("CHANGELOG.md", self.CHANGELOG_EN)):
+            self.assertTrue(os.path.exists(os.path.join(ROOT, en)),
+                            f"{en} 不存在")
+            with open(os.path.join(ROOT, zh), encoding="utf-8") as f:
+                zh_text = f.read()
+            with open(os.path.join(ROOT, en), encoding="utf-8") as f:
+                en_text = f.read()
+            self.assertIn(f"]({en})", zh_text,
+                         f"{zh} 里没有指向 {en} 的链接")
+            self.assertIn(f"]({zh})", en_text,
+                         f"{en} 里没有指回 {zh} 的链接")
+
+    def test_english_readme_is_not_a_stub(self):
+        """英文版不能是个「即将推出」的占位 —— 那样比没有更糟。"""
+        with open(os.path.join(ROOT, self.README_EN), encoding="utf-8") as f:
+            text = f.read()
+        self.assertGreater(len(text.splitlines()), 60, "英文 README 太短，接近占位")
+        for token in ("docker pull", "ghcr.io/sopyk/webhook2nats",
+                      "docker compose up -d", "/version", "evt.>"):
+            self.assertIn(token, text,
+                         f"英文 README 缺关键内容 {token!r}，看着像个占位文件")
+
+    def test_both_readmes_agree_on_the_registry(self):
+        """两边写的镜像仓库路径必须一致 —— 不一致时照英文版 pull 会失败。"""
+        def registry_of(path):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                text = f.read()
+            found = re.findall(r"ghcr\.io/sopyk/webhook2nats", text)
+            self.assertTrue(found, f"{path} 里没提 GHCR 路径")
+            return set(found)
+        self.assertEqual(registry_of("README.md"), registry_of(self.README_EN))
+
+    def test_both_readmes_agree_on_doc_listing(self):
+        """两边列出的 docs/ 链接必须指向同一批文件。"""
+        def docs_of(path):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                text = f.read()
+            return set(re.findall(r"\]\((docs/[\w./-]+)\)", text))
+        zh, en = docs_of("README.md"), docs_of(self.README_EN)
+        # 英文版允许少列（它主要是摘要），但不允许指向不存在的文件
+        self.assertTrue(en <= zh, f"英文 README 指了中文版没有的文档: {en - zh}")
+        for link in en:
+            self.assertTrue(os.path.exists(os.path.join(ROOT, link)),
+                            f"{link} 是英文 README 里指向但不存在的文件")
+
+    def test_both_readmes_agree_on_test_count(self):
+        """测试条数两边一致 —— 不一致说明有一边忘了更新。
+
+        不写死具体数字，只要求两份里出现的数字相同。
+        """
+        pat = re.compile(r"\*\*(\d+) 条\*\*|\*\*(\d+) tests\*\*")
+        def count_of(path):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                m = pat.search(f.read())
+            self.assertIsNotNone(m, f"{path} 里没写测试条数")
+            return m.group(1) or m.group(2)
+        self.assertEqual(count_of("README.md"), count_of(self.README_EN),
+                         "两份 README 的测试条数不一致")
+
+    def test_changelog_en_matches_zh_top_version(self):
+        """英文 CHANGELOG 顶部的版本必须与中文版一致。"""
+        def top_of(path):
+            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+                head = f.read().split("---", 1)[-1]
+            m = re.search(r"^##\s+(\d+\.\d+\.\d+)", head, re.M)
+            self.assertIsNotNone(m, f"{path} 里找不到版本标题")
+            return m.group(1)
+        self.assertEqual(top_of("CHANGELOG.md"), top_of(self.CHANGELOG_EN))
+
+    def test_no_version_literals_in_english_docs(self):
+        """英文文档同样不许写死版本字面量（会过期）。"""
+        offending = []
+        for name in (self.README_EN, self.CHANGELOG_EN):
+            with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+                for i, line in enumerate(f, 1):
+                    if re.search(r"\d+\.\d+\.\d+-(?:rc|beta|alpha)", line):
+                        offending.append(f"{name}:{i}")
+        self.assertEqual(offending, [],
+                        f"英文文档里写死了预发布版本号（应只由 CI 从 VERSION 推导）: {offending}")
+
+    def test_dockerhub_description_is_present_and_usable(self):
+        """Docker Hub 文案必须在，且不含版本字面量、含验证步骤。"""
+        path = os.path.join(ROOT, "docs", "dockerhub-description.md")
+        self.assertTrue(os.path.exists(path), "缺 Docker Hub 文案")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        # 必须讲清先订阅再触发 —— 那是验收时最常见的误判
+        self.assertIn("先订阅再触发", text)
+        self.assertIn("Subscribe before triggering", text)
+        # 必须给出完整可用的启动命令
+        self.assertIn("docker run", text)
+        self.assertIn("ghcr.io/sopyk/webhook2nats", text)
+        # 不许写死预发布版本号
+        self.assertNotRegex(text, r"\d+\.\d+\.\d+-(?:rc|beta|alpha)\d")
+
+
 class GitignoreCoverageTest(unittest.TestCase):
     """.gitignore 必须真的挡住本地文件和过程文件。
 

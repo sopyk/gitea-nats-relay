@@ -1,5 +1,7 @@
 # Webhook2NATS
 
+[English](README.en.md) · 中文
+
 一个轻量的 **Webhook → Core NATS** 实时门铃转发器。
 
 平台（Gitea / Forgejo / GitHub / GitLab / 任何会发 Webhook 的系统）推事件，
@@ -47,12 +49,12 @@ curl -s localhost:8090/version
 一队 Agent 每几分钟轮询一次代码托管平台：空请求很多，延迟最多一个轮询周期。
 
 ```
-   改之前                                  改之后
-┌────────┐  轮询   ┌────────┐          ┌────────┐ webhook ┌──────────────┐ 门铃  ┌───────┐
-│ Agent  │ ──────▶ │  Gitea │          │ 平台   │ ──────▶ │ Webhook2NATS │ ────▶ │ Agent │
-└────────┘  分钟级 └────────┘          └────────┘         └──────────────┘ 毫秒级 └───────┘
-  延迟上限 = 一个轮询周期                  延迟上限 = 一个网络往返
-  空请求 = 大部分轮询                       空请求 = 0
+   改之前                                改之后
+┌────────────┐         ┌────────────┐    ┌────────────┐         ┌──────────────┐         ┌────────────┐         ┌────────────┐
+│   Agent    │         │   Gitea    │    │    平台    │         │ Webhook2NATS │         │    NATS    │         │   Agent    │
+└────────────┘         └────────────┘    └────────────┘         └──────────────┘         └────────────┘         └────────────┘
+  延迟上限 = 一个轮询周期                                延迟上限 = 一个网络往返
+  空请求 = 大部分轮询                                                          空请求 = 0
 ```
 
 **「门铃」而不是「内容」**：NATS 上只有 `repo / number / actor / mentions /
@@ -176,10 +178,13 @@ docker logs webhook2nats 2>&1 | grep 'delivery=<uuid>'
 | [架构与设计](docs/architecture.md) | 为什么这么做、一个事件端到端走一遍、设计取舍 | 所有人，建议先读 |
 | [接入一个平台](docs/integration.md) | 加一个新平台要声明哪六件事、Gitea 的事件头对照、配置里的坑 | 要扩展的人 |
 | [参考](docs/reference.md) | 全部协议契约：subject / 消息格式 / HTTP / 配置项对照 / 实现状态 | 写 Agent 的人、查参数的人 |
-| [运维手册](docs/operations.md) | 部署、日志、排障、验收注意���点、测试套件 | 部署与值班的人 |
+| [运维手册](docs/operations.md) | 部署、日志、排障、验收注意点、测试套件 | 部署与值班的人 |
+| [Docker Hub 镜像说明](docs/dockerhub-description.md) | 往 Docker Hub 页面贴的中英对照文案 | 发布镜像的人 |
 
 模板文件：[`config/webhook2nats.example.toml`](config/webhook2nats.example.toml) ·
 [`relay.env.example`](relay.env.example)
+
+本文档有[英文版](README.en.md)（摘要版，细节仍以中文文档为准）。
 
 ## 开发
 
@@ -192,5 +197,5 @@ python3 test_logs.py          # 日志：降级、隐私、限流、轮转
 python3 test_e2e.py           # 仿真：keep-alive / 注入 / 并发 / 真实 NATS
 ```
 
-共 **243 条**，不需要真实 NATS 或外网（`test_e2e.py` 会自己拉一个容器）。
+共 **272 条**，不需要真实 NATS 或外网（`test_e2e.py` 会自己拉一个容器）。
 详见 [测试说明](docs/operations.md#测试)。
