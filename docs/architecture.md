@@ -8,6 +8,17 @@
 
 ### 架构
 
+```mermaid
+flowchart LR
+    P["来源平台<br/>Gitea / GitHub / …"] -->|"webhook（HTTP POST）"| R["Webhook2NATS<br/>（通用通道）<br/>provider 适配 + 去重状态"]
+    R -->|"Core NATS 门铃 subject"| N[("NATS")]
+    N --> A["订阅的 Agent<br/>（在线时收到）"]
+    A -.->|"自己去拉完整 issue / PR 内容"| P
+```
+
+<details>
+<summary>纯文本版</summary>
+
 ```
 ┌──────────────┐  webhook（HTTP POST，平台各自的签名算法）  ┌──────────────────┐  Core NATS   ┌──────────────────┐
 │  Gitea /     │ ────────────────────────────────────────▶ │   Webhook2NATS    │ ───────────▶ │  订阅的 Agent     │
@@ -18,6 +29,8 @@
          │ Agent 自己去拉完整 issue/PR 内容                          │ provider 适配 + 去重状态
          └──────────────────────────────────────────────────────────┘
 ```
+
+</details>
 
 每个事件的处理流程：
 

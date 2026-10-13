@@ -53,6 +53,24 @@ curl -s localhost:8090/version
 A team of agents polling a self-hosted code platform every few minutes produces
 mostly empty requests, with latency bounded by the polling interval.
 
+```mermaid
+flowchart LR
+    subgraph B["Before: agents poll"]
+        direction LR
+        b1["Agent"] -->|"every few minutes<br/>mostly empty requests"| b2["Gitea"]
+    end
+    subgraph A["After: webhook doorbell"]
+        direction LR
+        a1["Platform"] -->|"webhook POST"| a2["Webhook2NATS"]
+        a2 -->|"publish doorbell"| a3[("NATS")]
+        a3 -->|"wakes subscriber"| a4["Agent"]
+    end
+    b2 ~~~ a1
+```
+
+<details>
+<summary>Plain-text version (terminals, Docker Hub, anywhere Mermaid is not rendered)</summary>
+
 ```
    Before                                  After
 ┌────────────┐  poll     ┌────────────┐    ┌────────────┐ webhook   ┌──────────────┐ bell      ┌────────────┐ publish   ┌────────────┐
@@ -61,6 +79,7 @@ mostly empty requests, with latency bounded by the polling interval.
   latency <= one poll cycle                              latency <= one round trip
   most requests are empty                                                    zero empty requests
 ```
+</details>
 
 **A bell, not the content.** Only `repo / number / actor / mentions / url /
 delivery` ride on NATS; the agent fetches the full content itself. So even a
@@ -210,5 +229,5 @@ python3 test_logs.py          # logging: degradation, privacy, rate limits, rota
 python3 test_e2e.py           # simulation: keep-alive / injection / concurrency / real NATS
 ```
 
-**274 tests**, none of which need real NATS or internet (`test_e2e.py` spins up
+**278 tests**, none of which need real NATS or internet (`test_e2e.py` spins up
 its own container). See the [testing notes](docs/operations.md#测试).

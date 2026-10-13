@@ -48,6 +48,24 @@ curl -s localhost:8090/version
 
 一队 Agent 每几分钟轮询一次代码托管平台：空请求很多，延迟最多一个轮询周期。
 
+```mermaid
+flowchart LR
+    subgraph B["改之前：Agent 轮询"]
+        direction LR
+        b1["Agent"] -->|"每几分钟一次<br/>大部分请求是空的"| b2["Gitea"]
+    end
+    subgraph A["改之后：webhook 门铃"]
+        direction LR
+        a1["平台"] -->|"webhook POST"| a2["Webhook2NATS"]
+        a2 -->|"发布门铃"| a3[("NATS")]
+        a3 -->|"订阅即达"| a4["Agent"]
+    end
+    b2 ~~~ a1
+```
+
+<details>
+<summary>纯文本版（终端、Docker Hub 等不渲染 Mermaid 的地方）</summary>
+
 ```
    改之前                                改之后
 ┌────────────┐  轮询   ┌────────────┐    ┌────────────┐ webhook ┌──────────────┐ 门铃    ┌────────────┐ 发布    ┌────────────┐
@@ -56,6 +74,7 @@ curl -s localhost:8090/version
   延迟上限 = 一个轮询周期                                延迟上限 = 一个网络往返
   空请求 = 大部分轮询                                                          空请求 = 0
 ```
+</details>
 
 **「门铃」而不是「内容」**：NATS 上只有 `repo / number / actor / mentions /
 url / delivery` 这些元数据，Agent 被叫醒后自己去平台拉完整内容。
@@ -197,5 +216,5 @@ python3 test_logs.py          # 日志：降级、隐私、限流、轮转
 python3 test_e2e.py           # 仿真：keep-alive / 注入 / 并发 / 真实 NATS
 ```
 
-共 **274 条**，不需要真实 NATS 或外网（`test_e2e.py` 会自己拉一个容器）。
+共 **278 条**，不需要真实 NATS 或外网（`test_e2e.py` 会自己拉一个容器）。
 详见 [测试说明](docs/operations.md#测试)。
