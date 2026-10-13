@@ -441,6 +441,89 @@ class TemplateUsabilityTest(unittest.TestCase):
                           f"README 的快速上手没提到 {token}，新用户会不知道要准备它")
 
 
+class DockerHubPublishingTest(unittest.TestCase):
+    """Docker Hub 推送策略的护栏。
+
+    策略：**只在稳定版 git tag 推送时推 Docker Hub**，且 tag 集合与 GHCR 一致、
+    「预发布不许动 latest」两边都生效、双架构两边都验。
+
+    这些断言全是在本地模拟时抓出真 bug 之后补的 —— 不模拟只读代码的话，
+    里面两个错（预发布判定漏 `-rc1`、「禁 latest」没排除稳定版）会把每一次
+    正式版发布都判成失败，而光看代码完全看不出来。
+    """
+
+    WORKFLOW = os.path.join(ROOT, ".github", "workflows", "publish.yml")
+
+    def _wf(self):
+        with open(self.WORKFLOW, encoding="utf-8") as f:
+            return f.read()
+
+    def test_dockerhub_is_targeted_only_by_stable_releases(self):
+        """Docker Hub 只在稳定版 git tag 推送时用。
+
+        同时保三件事：那边第一个镜像干净、不堆分支 tag、
+        分支构建（可能来自他人 PR）不需要 DockerHub 凭据。
+        """
+        wf = self._wf()
+        self.assertIn("push/refs/tags/v*", wf,
+                      "决策脚本里找不到稳定版判断分支")
+        self.assertIn("只推 GHCR", wf, "决策脚本缺少非正式版的说明分支")
+        for step in re.findall(r"- name: Log in to Docker Hub(.*?)\n\n", wf, re.S):
+            self.assertIn("dockerhub == 'true'", step,
+                         "Docker Hub 登录没挂条件 —— 分支构建也会去要凭据")
+
+    def test_dockerhub_credentials_are_validated_up_front(self):
+        """secret 缺失必须明确报错，而不是一个含糊的 unauthorized。"""
+        wf = self._wf()
+        self.assertIn("DOCKERHUB_USERNAME", wf)
+        self.assertIn("DOCKERHUB_TOKEN", wf)
+        self.assertIn("缺少 secret", wf,
+                      "没有 secret 缺失的显式校验 —— 名字填错只会得到含糊报错")
+
+    def test_tag_policy_covers_every_registry(self):
+        wf = self._wf()
+        self.assertIn(
+            'is_prerelease = any(f"-{p}" in ref', wf,
+            "预发布判定写错了 —— 漏掉 -rc1 这种最常见形式")
+        self.assertIn("if is_prerelease:", wf)
+        self.assertIn("预发布版本不允许移动 latest", wf,
+                      "「不许带 latest」没限定在预发布时，会把正式版发布判失败")
+        self.assertIn("缺 latest", wf, "缺少稳定版必须带 latest 的断言")
+        self.assertIn("tag 集合与", wf,
+                      "没有两个 registry tag 集合一致性的断言")
+
+    def test_architecture_verification_covers_every_registry(self):
+        """双架构必须逐个 registry 验。
+
+        本地是 arm64，验证不了 amd64 有没有漏推，只能读远端 manifest。
+        只验 GHCR 的话，Docker Hub 上出了 arm64-only 镜像也没人发现 ——
+        而那正是「别人 pull 下来在自己机器上跑不了」的成因。
+        """
+        wf = self._wf()
+        verify = wf[wf.index("Verify both architectures"):]
+        # 必须覆盖 Docker Hub 的路径，而不是只查 tags[0]
+        self.assertIn("docker.io", verify, "双架构验证只覆盖了 GHCR")
+        # 实现从手写 curl 换成 buildx imagetools 后，这里从「必须出现
+        # auth.docker.io/token」改成「必须用 imagetools」—— 新版由 buildx
+        # 统一处理两个 registry 的鉴权。等价强度保留，关键在下一条的循环。
+        self.assertIn("imagetools inspect", verify,
+                      "没有用 imagetools —— 换回手写 curl 的话，要为两个 "
+                      "registry 分别处理各自不同的鉴权端点")
+        self.assertIn("while IFS= read -r path", verify,
+                      "没有循环遍历 registry —— 只会验第一个，Docker Hub 被漏掉")
+        self.assertIn("rpartition(':')", verify,
+                      "没从镜像引用里剥出 registry 路径")
+        self.assertIn("缺少架构", verify, "没有缺架构的判断")
+
+    def test_dockerhub_policy_is_documented(self):
+        with open(os.path.join(ROOT, "docs", "operations.md"),
+                  encoding="utf-8") as f:
+            ops = f.read()
+        self.assertIn("仅正式版", ops,
+                      "运维手册没写 Docker Hub 只推正式版，"
+                      "用户会疑惑分支构建为什么没同步")
+
+
 class VersionConsistencyTest(unittest.TestCase):
     """版本号只有一处真源，其余地方不许再硬编码。
 
@@ -538,27 +621,33 @@ class VersionConsistencyTest(unittest.TestCase):
                   encoding="utf-8") as f:
             wf = f.read()
         self.assertIn("Assert tag policy", wf, "CI 里没有 tag 策略断言")
-        self.assertRegex(wf, r"预发布不允许移动 latest",
-                         "tag 策略断言里没有预发布的检查")
-        self.assertRegex(wf, r"正式版必须产出 latest",
-                         "tag 策略断言里没有稳定版的检查")
+        self.assertIn("预发布版本不允许移动 latest", wf,
+                      "tag 策略断言里没有预发布的检查")
+        self.assertIn("缺 latest", wf, "tag 策略断言里没有稳定版的检查")
+        # 预发布判定必须覆盖 -rc1 这种「数字紧跟」的形式
+        self.assertIn('f"-{p}" in ref', wf,
+                      "预发布判定写错了 —— 漏掉 -rc1 这种最常见形式")
 
     def test_tag_policy_assertion_parses_image_refs_correctly(self):
-        """反向自检：断言必须真的能认出 latest。
+        """反向自检：断言必须真的能认出 latest，且能区分 registry。
 
         metadata-action 的 json 输出里，tags 是**完整镜像引用**
         （`ghcr.io/sopyk/webhook2nats:latest`），不是裸 tag 名。直接拿去
         和 'latest' 比较永远不相等 —— 那条断言会每次都判「缺 latest」，
         把每一次正式发布都卡死。这个坑踩过一次，所以钉死。
+
+        推两个 registry 时每个逻辑 tag 出现两次，所以正确写法是按
+        「registry 路径 → tag 集合」分组，而不是拍平成一张大表。
         """
         with open(os.path.join(ROOT, ".github", "workflows", "publish.yml"),
                   encoding="utf-8") as f:
             wf = f.read()
-        self.assertIn("rsplit(':',1)[-1]", wf,
-                      "断言没有从镜像引用里剥出 tag 名，会把每次发布都判成缺 latest")
-        self.assertNotRegex(
-            wf, r"print\('\s*\.join\(json\.load\(sys\.stdin\)\['tags'\]\)",
-            "断言把完整镜像引用当成了裸 tag 名")
+        self.assertIn('rpartition(":")', wf,
+                      "断言没有从镜像引用里剥出路径和 tag，"
+                      "会把每次发布都判成缺 latest")
+        self.assertIn("by_reg", wf,
+                      "断言没有按 registry 分组 —— 推两个 registry 时"
+                      "逻辑 tag 会重复出现，拍平就分不清谁是谁")
 
 
 class GitignoreCoverageTest(unittest.TestCase):
