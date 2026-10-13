@@ -64,25 +64,89 @@ jobs:
             type=raw,value=${{ inputs.tag }}
             type=sha,format=short
 
+      # /version 要报的两个值都从仓库里读，不在别处硬编码 ——
+      # 「版本号出现在多处、有的改了有的没改」是最常见的发版事故。
+      - name: Read version
+        id: ver
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: ./relay
           platforms: linux/amd64,linux/arm64
           push: true
-          # 让 /version 端点能报出真实 commit。刻意不读 .git：
-          # 交付镜像里没有它，多阶段构建里读了也只是无谓耦合。
           build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
             GIT_SHA=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+
+      # tag 策略断言：把「latest 只跟正式版走」从文档里的说法
+      # 变成构建当场就验的不变量。
+      #
+      # 为什么要专门加这一步：metadata-action 的 latest=auto，官方文档明确
+      # 写了预发布（rc/beta/alpha）不产出 latest。但同一篇文档的「Latest tag」
+      # 一节又把 type=ref,event=tag 列进 latest 的适用范围，而我们的规则里
+      # 正好有这一条 —— 文档在这两点上并不完全自洽。与其赌默认行为不会变，
+      # 不如直接断言。
+      #
+      # 赌输的后果很具体：哪天有人推了预发布 git tag，latest 被移动，
+      # 别人 docker compose pull 拿到没测过的镜像，且全程无任何报错。
+      - name: Assert tag policy
+        env:
+          REF: ${{ github.ref }}
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          # json['tags'] 里是**完整镜像引用**（ghcr.io/...:latest），
+          # 直接拿去和 'latest' 比永远不相等 —— 那会让断言每次都报
+          # 「缺 latest」，把每一次正式发布都卡死。只取最后一段。
+          tags=$(echo "$META_JSON" | python3 -c "
+          import json,sys
+          print(' '.join(t.rsplit(':',1)[-1]
+                           for t in json.load(sys.stdin)['tags']))")
+          echo "本次产出的 tag: $tags"
+
+          is_prerelease=false
+          case "$REF" in
+            refs/tags/*-rc*|refs/tags/*-beta*|refs/tags/*-alpha*)
+              is_prerelease=true ;;
+          esac
+
+          has_latest=false
+          for t in $tags; do
+            if [ "$t" = "latest" ]; then has_latest=true; fi
+          done
+
+          if [ "$is_prerelease" = true ] && [ "$has_latest" = true ]; then
+            echo "::error::预发布不允许移动 latest —— 那会让别人 docker compose pull 到未经测试的镜像。tag 规则被改了吗？"
+            exit 1
+          fi
+
+          # 打了 git tag 的**稳定**版本必须带 latest，否则 compose 里的
+          # :latest 会指向旧版本或者根本不存在。
+          # 这两条互斥：预发布已经在上面判过了，别拿「正式版缺 latest」
+          # 去误伤一个正确的预发布构建。
+          case "$REF" in
+            refs/tags/*)
+              if [ "$is_prerelease" = false ] && [ "$has_latest" = false ]; then
+                echo "::error::正式版必须产出 latest，实际 tags: $tags"
+                exit 1
+              fi ;;
+          esac
+
+          echo "tag 策略校验通过（预发布=$is_prerelease latest=$has_latest）"
+
+
       # QEMU 交叉构建偶尔会静默跳过某个架构，本地能验的就在 CI 里也验。
       # 用 buildx 自带的 imagetools 读远端 manifest —— 它已经处理了
       # token、Accept 头、多架构 index 这些细节，手写 curl 容易出错
       # （前两版就栽在 tags 是 list 不是 dict、以及多行 JSON 被 YAML 折行上）。
+
       - name: Verify both architectures landed
         env:
           IMAGE: ${{ steps.meta.outputs.tags }}

@@ -7,11 +7,20 @@ RUN pip install --no-cache-dir "nats-py>=2.16,<3"
 COPY app.py config.py core.py logs.py providers.py server.py /app/
 # 刻意不设 MEMBERS_FILE 等路径类环境变量：它们优先级高于配置文件，
 # 在镜像里烤死默认值会让 config/webhook2nats.toml 里的对应项永远不生效。
-# /version 端点要报的 git SHA。由 CI 传 --build-arg GIT_SHA=${{ github.sha }}。
-# 本地 docker build 不传就是空，代码里回落成 "unknown" —— 刻意不去读 .git，
-# 交付镜像里本来就没有，而且读了会在多阶段构建里制造无谓的耦合。
+# /version 端点报的两个值，都由 CI 传 --build-arg 注入：
+#   VERSION → 发布版本号（仓库根的 VERSION 文件）
+#   GIT_SHA → 精确到 commit
+#
+# 刻意不读 .git：交付镜像里本来就没有它，多阶段构建里读了只是无谓耦合。
+# 本地 docker build 不传就是空，代码里回落成 "unknown"。
+#
+# 版本号**只**从构建期注入，不在镜像里烤死 —— 否则每次发版都要改 Dockerfile，
+# 而那正是「版本号出现在多处、有的改了有的没改」的经典成因。
+ARG VERSION=""
+ENV WEBHOOK2NATS_VERSION=$VERSION
+
 ARG GIT_SHA=""
-ENV WEBHOOK2NATS_VERSION=$GIT_SHA
+ENV WEBHOOK2NATS_COMMIT=$GIT_SHA
 
 ENV PYTHONDONTWRITEBYTECODE=1
 EXPOSE 8090
