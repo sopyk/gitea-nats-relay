@@ -12,6 +12,34 @@
 - **定位**：只做通知。**不存正文、不标已读、不代替任何 Agent 行动。**
   来源平台始终是事实源。
 
+## 镜像
+
+```bash
+docker pull ghcr.io/sopyk/webhook2nats:latest
+```
+
+| | |
+|---|---|
+| 仓库 | **`ghcr.io/sopyk/webhook2nats`**（GitHub Container Registry，公开、匿名可拉） |
+| 架构 | `linux/amd64` + `linux/arm64` |
+| 稳定版 | `:latest`、`:1.0`、`:1.0.0`、`v1.0.0` |
+| 预发布 | `:X.Y.Z-rcN` 之类的预发布号 —— **不会**移动 `:latest` |
+
+> 上面刻意写成 `X.Y.Z-rcN` 而不是具体版本：文档里出现字面量版本号，
+> 到下个版本就会变成一个没人更新的旧数字。仓库里有一条测试在盯着这件事
+> （`test_deploy.py::test_no_stale_version_literals_anywhere`）。
+
+`:latest` 只跟正式版走。预发布版本只挂自己的号，别人 `docker compose pull`
+拿到的永远是已发布的稳定版；CI 里有一条断言在强制这条规则，预发布若产出
+`latest` 会直接构建失败。
+
+想确认手上跑的是哪一版：
+
+```bash
+curl -s localhost:8090/version
+# {"status":"ok","version":"1.0.0","commit":"22c6f52…","started_at":…,"uptime_seconds":…}
+```
+
 ---
 
 ## 它解决什么问题
@@ -54,7 +82,9 @@ curl -s localhost:8090/healthz        # → {"status": "ok", ...}
 
 想从源码构建：`docker compose -f docker-compose.build.yml up -d --build`。
 
-完整挂载关系、镜像 tag 的取舍见 [运维手册](docs/operations.md)。
+完整挂载关系、镜像 tag 的取舍、以及**单实例约束**（去重状态是本地的，
+一个 webhook 回调只能指向一个 relay，多实例会重复下发且无任何报错）
+见 [运维手册](docs/operations.md)。
 
 ---
 

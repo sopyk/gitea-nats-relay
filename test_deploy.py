@@ -13,6 +13,7 @@ import importlib.util
 import os
 import re
 import subprocess
+from pathlib import Path
 import sys
 import tomllib
 import unittest
@@ -347,6 +348,275 @@ class ExampleConfigTest(unittest.TestCase):
             self.assertIn(real, p["events"], f"[events] 缺 {real}")
 
 
+class VersionConsistencyTest(unittest.TestCase):
+    """版本号只有一处真源，其余地方不许再硬编码。
+
+    「版本号出现在多个地方、有的更新了有的没更新」是发版事故里最常见也最难
+    查的一种：各处看起来都像对的，只有对照着比才能发现有一个是旧的。
+    所以这里把「比一遍」变成每次跑测试都做的事。
+    """
+
+    def setUp(self):
+        self.version = Path(ROOT, "VERSION").read_text(encoding="utf-8").strip()
+        self.assertTrue(self.version, "VERSION 文件是空的")
+        self.assertRegex(
+            self.version, r"^\d+\.\d+\.\d+$",
+            f"VERSION 不是规范的三段式 semver: {self.version!r}")
+
+    def test_changelog_top_entry_matches_version(self):
+        path = Path(ROOT, "CHANGELOG.md")
+        self.assertTrue(path.exists(), "没有 CHANGELOG.md")
+        head = path.read_text(encoding="utf-8").split("---", 1)[-1]
+        found = re.findall(r"^##\s+(\d+\.\d+\.\d+)", head, re.M)
+        self.assertTrue(found, "CHANGELOG 里找不到版本标题")
+        self.assertEqual(
+            found[0], self.version,
+            f"CHANGELOG 最新版本是 {found[0]}，VERSION 文件是 {self.version} —— "
+            f"发版时忘了改其中一个")
+
+    def test_no_stale_version_literals_anywhere(self):
+        """除 VERSION / CHANGELOG 外，不该再出现别的版本号字面量。
+
+        扫的是「形如 x.y.z 且带 pre-release 后缀」这种**只在版本语境下**
+        才出现的写法（`-rc1`、`-beta.2`、`-alpha`）。光扫 `1.0.0` 会误伤
+        端口号、镜像 label 之类。
+        """
+        offenders = []
+        for path in doc_files() + [os.path.join(ROOT, "docker-compose.yml"),
+                                    os.path.join(ROOT, "docker-compose.build.yml"),
+                                    os.path.join(ROOT, "relay", "Dockerfile")]:
+            rel = os.path.relpath(path, ROOT)
+            if rel in ("CHANGELOG.md", "VERSION"):
+                continue
+            with open(path, encoding="utf-8") as f:
+                for i, line in enumerate(f, 1):
+                    for m in re.finditer(r"\d+\.\d+\.\d+-(?:rc|beta|alpha)", line):
+                        offenders.append(f"{rel}:{i}: {m.group(0)}")
+        self.assertEqual(
+            offenders, [],
+            f"这些地方出现了预发布版本号字面量（应只由 CI 从 VERSION 推导）: {offenders}")
+
+    def test_compose_does_not_pin_a_version(self):
+        """compose 不许写死版本号。
+
+        写死了就要人记得更新 —— 而这正是这套护栏要消灭的那类遗漏。
+        compose 只用 `:latest`，版本身份由 CI 产出的 tag 决定。
+
+        只看**生效的配置行**：注释里可以（也应该）写「想钉版本就改成
+        `:1.0`」这类说明，那是给人看的，不是 compose 实际读的值。
+        """
+        for name in ("docker-compose.yml", "docker-compose.build.yml"):
+            with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+                for i, line in enumerate(f, 1):
+                    if line.lstrip().startswith("#"):
+                        continue
+                    if re.search(r"image:.*:\d+\.\d+", line):
+                        self.fail(
+                            f"{name}:{i} 写死了镜像版本号: {line.strip()} —— "
+                            f"改用 :latest，版本身份交给 CI")
+
+    def test_ci_reads_the_version_file(self):
+        """CI 必须从 VERSION 文件读，而不是在 workflow 里再写一个版本号。"""
+        with open(os.path.join(ROOT, ".github", "workflows", "publish.yml"),
+                  encoding="utf-8") as f:
+            wf = f.read()
+        self.assertIn("cat VERSION", wf,
+                      "CI 没有从 VERSION 文件读版本号")
+        self.assertIn("VERSION=${{ steps.ver.outputs.version }}", wf,
+                      "CI 没把版本号作为 build-arg 传进镜像")
+
+    def test_dockerfile_takes_version_from_build_arg(self):
+        """镜像里的版本号只能来自构建期注入，不能烤死。"""
+        with open(os.path.join(ROOT, "relay", "Dockerfile"),
+                  encoding="utf-8") as f:
+            df = f.read()
+        self.assertIn('ARG VERSION=""', df, "Dockerfile 没有 ARG VERSION")
+        self.assertNotRegex(
+            df, r"WEBHOOK2NATS_VERSION=\d",
+            "Dockerfile 把版本号烤死了 —— 每次发版都得改它")
+
+    def test_workflow_enforces_latest_only_for_stable(self):
+        """「latest 只跟正式版走」必须有断言强制，不能只写在文档里。
+
+        这条正是为了兑现「别人跟着 latest 拉，不会拿到测试版」：
+        预发布构建若产出 latest，CI 必须当场失败。
+        """
+        with open(os.path.join(ROOT, ".github", "workflows", "publish.yml"),
+                  encoding="utf-8") as f:
+            wf = f.read()
+        self.assertIn("Assert tag policy", wf, "CI 里没有 tag 策略断言")
+        self.assertRegex(wf, r"预发布不允许移动 latest",
+                         "tag 策略断言里没有预发布的检查")
+        self.assertRegex(wf, r"正式版必须产出 latest",
+                         "tag 策略断言里没有稳定版的检查")
+
+    def test_tag_policy_assertion_parses_image_refs_correctly(self):
+        """反向自检：断言必须真的能认出 latest。
+
+        metadata-action 的 json 输出里，tags 是**完整镜像引用**
+        （`ghcr.io/sopyk/webhook2nats:latest`），不是裸 tag 名。直接拿去
+        和 'latest' 比较永远不相等 —— 那条断言会每次都判「缺 latest」，
+        把每一次正式发布都卡死。这个坑踩过一次，所以钉死。
+        """
+        with open(os.path.join(ROOT, ".github", "workflows", "publish.yml"),
+                  encoding="utf-8") as f:
+            wf = f.read()
+        self.assertIn("rsplit(':',1)[-1]", wf,
+                      "断言没有从镜像引用里剥出 tag 名，会把每次发布都判成缺 latest")
+        self.assertNotRegex(
+            wf, r"print\('\s*\.join\(json\.load\(sys\.stdin\)\['tags'\]\)",
+            "断言把完整镜像引用当成了裸 tag 名")
+
+
+class GitignoreCoverageTest(unittest.TestCase):
+    """.gitignore 必须真的挡住本地文件和过程文件。
+
+    （取代了原来那条只查 3 个文件名、2 个用例的 GitignoreTest ——
+     它既没覆盖过程文件，也没覆盖 docker-compose.override 这类本地覆盖文件。
+     保留两个同名类是隐患：Python 里后定义的会静默遮蔽先定义的，
+     跑出来的用例名完全看不出哪个在生效。）
+
+    为什么需要测试来盯一份纯文本：它是**唯一一道不靠自觉的防线**。
+    `git add .` 不会问你「这个文件带不带环境值」，而 `.gitignore` 写漏一条
+    规则，等到东西进了公开仓库才发现就晚了 —— 真实配置一旦 push，
+    即使后续 commit 删掉，git 历史里还留着，必须改写历史才能真正移除。
+
+    下面这份列表是**实测出来的**：拿原规则去 check-ignore 一批真实文件名，
+    `docker-compose.override.yml`（compose 会自动合并它，正是大家放本地
+    密钥的地方）、根目录的 `members.json`、`*.log`、`*.env.local` 全部漏网。
+    """
+
+    # 必须被忽略。新增规则就往对应组里加。
+    MUST_IGNORE = [
+        # 真实密钥与配置
+        "relay.env", "relay.env.local", "prod.env", ".env", ".env.local",
+        "config/webhook2nats.toml", "config/members.json",
+        "members.json",                       # 不在 config/ 下也要挡
+        "nested/deep/webhook2nats.toml",
+        # 任意深度的也要挡。少了这两条的话，只删掉 `**/...` 那两行规则
+        # 而根目录那条还在，上面的断言依然全绿 —— 规则失效了测不出来。
+        "nested/deep/members.json",
+        "nested/deep/relay.env",
+        # 证书与凭据
+        "server.pem", "tls.key", "ca.crt", "bundle.p12",
+        # 运行产物
+        "data/seen.json", "data/logs/relay.log",
+        "relay.log", "relay.pid", "seen.json",
+        # 本地 compose 覆盖（compose 会自动合并它）
+        "docker-compose.override.yml",
+        "docker-compose.override.yaml",
+        # 编辑器与工具产物
+        ".DS_Store", "__pycache__/core.cpython-312.pyc", "app.pyc",
+        "main.py.swp", "README.md~", "config.toml.bak", "config.toml.orig",
+        ".idea/workspace.xml", ".vscode/settings.json",
+        # Python 构建与工具缓存
+        ".coverage", "htmlcov/index.html", "webhook2nats.egg-info/PKG-INFO",
+        ".venv/bin/python", "build/lib/core.py", "dist/core.py",
+        ".pytest_cache/CACHEDIR.TAG", ".mypy_cache/3.12/stub.py",
+        # 调试残留
+        "nohup.out", "core.12345",
+    ]
+
+    # 必须**不能**被忽略 —— 模板与源码要能进库。
+    MUST_TRACK = [
+        "relay.env.example",
+        "config/webhook2nats.example.toml",
+        "README.md", "docker-compose.yml", "docker-compose.build.yml",
+        "test_deploy.py", "relay/logs.py", "relay/server.py",
+        "docs/reference.md", "docs/operations.md",
+    ]
+
+    def _check_ignore(self, path):
+        r = subprocess.run(["git", "check-ignore", "--no-index", "-q", path],
+                           cwd=ROOT, capture_output=True)
+        if r.returncode not in (0, 1):
+            self.skipTest(f"git check-ignore 跑不起来: {r.stderr[:80]!r}")
+        return r.returncode == 0
+
+    def test_local_and_temp_files_are_ignored(self):
+        leaked = [p for p in self.MUST_IGNORE if not self._check_ignore(p)]
+        self.assertEqual(
+            leaked, [],
+            f"这些本地/临时文件没被 .gitignore 挡住，git add . 会带进仓库: {leaked}")
+
+    def test_templates_and_source_are_not_ignored(self):
+        blocked = [p for p in self.MUST_TRACK if self._check_ignore(p)]
+        self.assertEqual(
+            blocked, [], f"这些该进库的文件被 .gitignore 挡住了: {blocked}")
+
+    def test_no_rule_is_redundantly_covering_the_probe(self):
+        """反向自检：断言必须真的依赖它声称的那条规则。
+
+        gitignore 经常「靠巧合挡住」——某条规则被另一条顺带覆盖了。
+        那样规则删掉了断言还是绿的，改动就不再受保护。这里在干净仓库里
+        只放**去掉该规则**的 gitignore，验证目标文件就漏网了。
+
+        规则片段要选得准：gitignore 里**不带斜杠的模式在任意层级都匹配**，
+        所以 `members.json` 一条就够，写 `**/members.json` 是多余的 ——
+        而那条多余的规则会让这条反向自检**永远抓不到真实回归**
+        （删掉真规则，多余那条还在，断言照样绿）。这个坑踩过。
+        """
+        import tempfile as _tf
+        with open(os.path.join(ROOT, ".gitignore"), encoding="utf-8") as f:
+            original = f.read()
+        # (要删掉的**整行规则**, 用它验证的探针路径)
+        #
+        # 探针路径必须选**只有这条规则能挡**的位置。例如
+        # `config/webhook2nats.toml` 就算删掉 `webhook2nats.toml` 规则，
+        # 仍然会被 `config/*` 顺手挡住 —— 拿它当探针，断言就永远发现不了
+        # 那条规则真的没了。
+        for rule_line, probe_file in (
+            ("docker-compose.override.yml", "docker-compose.override.yml"),
+            ("members.json", "nested/deep/members.json"),
+            ("webhook2nats.toml", "nested/webhook2nats.toml"),
+            ("*.log", "deep/dir/relay.log"),
+            ("*.pem", "certs/server.pem"),
+        ):
+            with self.subTest(probe=probe_file):
+                lines = original.splitlines()
+                self.assertIn(
+                    rule_line, [l.strip() for l in lines],
+                    f"没找到规则 {rule_line!r}（整行比对），反向自检的前提没了")
+                stripped = "\n".join(l for l in lines if l.strip() != rule_line)
+                probe = _tf.mkdtemp()
+                try:
+                    with open(os.path.join(probe, ".gitignore"), "w",
+                              encoding="utf-8") as f:
+                        f.write(stripped)
+                    subprocess.run(["git", "init", "-q"], cwd=probe, check=True)
+                    r = subprocess.run(
+                        ["git", "check-ignore", "--no-index", "-q", probe_file],
+                        cwd=probe, capture_output=True)
+                    self.assertEqual(
+                        r.returncode, 1,
+                        f"删掉规则 {rule_line!r} 后 {probe_file} 仍被忽略 —— "
+                        f"有别的规则在兜底，这条断言抓不到真实回归")
+                finally:
+                    subprocess.run(["rm", "-rf", probe], check=False)
+
+    def test_nothing_sensitive_is_already_tracked(self):
+        """已经进了库的东西现在就不在里面。
+
+        这是唯一能回答「历史上有没有漏过」的检查 —— gitignore 只管未来。
+        """
+        try:
+            r = subprocess.run(["git", "ls-files"], cwd=ROOT,
+                               capture_output=True, text=True, timeout=30)
+            tracked = r.stdout.split()
+        except (subprocess.SubprocessError, OSError):
+            self.skipTest("拿不到 git ls-files")
+        self.assertTrue(tracked, "一个跟踪文件都没有，扫描逻辑坏了")
+        for name in tracked:
+            base = os.path.basename(name)
+            self.assertFalse(
+                name.endswith((".log", ".pem", ".key", ".pyc", ".bak")),
+                f"不该被跟踪的文件已在库中: {name}")
+            self.assertNotIn(
+                base, ("members.json", "webhook2nats.toml", "relay.env"),
+                f"真实配置/密钥已被提交（一旦 push 进历史就等于泄露，"
+                f"必须改写历史才能真正移除）: {name}")
+
+
 class ReadmeConsistencyTest(unittest.TestCase):
     """文档与实际产物的一致性（扫 README + docs/*.md）。"""
 
@@ -594,8 +864,12 @@ class EnvExampleTest(unittest.TestCase):
         # 放进 env 文件反而会让运维以为可以在那里改成宿主路径。
         # WEBHOOK2NATS_VERSION 同理 —— 它由 Dockerfile 的 ARG 在构建期烤进
         # 镜像，写进 relay.env 只会让人以为改了它就能换版本。
+        # WEBHOOK2NATS_VERSION / WEBHOOK2NATS_COMMIT 同理 —— 它们由 Dockerfile 的
+        # ARG 在**构建期**烤进镜像（CI 从仓库根的 VERSION 文件传入），
+        # 写进 relay.env 只会让人以为改了它就能查出版本，实际上改的是
+        # 运行时环境变量，与镜像里已经烤好的那个无关。
         provided_elsewhere = {"MEMBERS_FILE", "DEDUP_FILE", "LISTEN",
-                              "WEBHOOK2NATS_VERSION"}
+                              "WEBHOOK2NATS_VERSION", "WEBHOOK2NATS_COMMIT"}
 
         missing = code_vars - documented - provided_elsewhere
         self.assertEqual(missing, set(),
@@ -672,28 +946,6 @@ class EnvExampleTest(unittest.TestCase):
         active = {l.split("=", 1)[0].strip() for l in text.splitlines() if "=" in l}
         for var in ("NATS_SERVERS", "NATS_USER", "NATS_PASSWORD", "WEBHOOK_SECRET"):
             self.assertIn(var, active, f"{var} 是必填项，不能注释掉")
-
-
-class GitignoreTest(unittest.TestCase):
-    """密钥必须真的被忽略掉 —— 这是 .gitignore 的唯一职责。"""
-
-    def _ignored(self, rel):
-        try:
-            r = subprocess.run(["git", "check-ignore", "-q", rel], cwd=ROOT,
-                               capture_output=True)
-        except FileNotFoundError:
-            self.skipTest("git 不可用")
-        return r.returncode == 0
-
-    def test_secrets_are_ignored(self):
-        for rel in ("relay.env", "config/members.json", "config/webhook2nats.toml"):
-            self.assertTrue(self._ignored(rel), f"{rel} 含真实值，必须被 .gitignore 排除")
-
-    def test_templates_are_tracked(self):
-        for rel in ("relay.env.example", "docker-compose.yml",
-                    "docker-compose.build.yml",
-                    "config/webhook2nats.example.toml"):
-            self.assertFalse(self._ignored(rel), f"{rel} 不含环境值，应该能进库")
 
 
 if __name__ == "__main__":

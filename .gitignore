@@ -1,11 +1,78 @@
+# ── 真实密钥与配置（最重要，绝不能进库）─────────────────────────
+#
+# 判据：凡是**这个部署环境特有的值**都归这一类。
+# 模板一律用 .example 后缀，那些没有环境值，可以公开。
+
 *.env
+*.env.*
 relay.env
-# 真实配置与成员映射（bind mount 进来的，含环境值）一律不进库。
+relay.env.*
+!*.env.example
+
+# 真实成员映射与配置。成员映射 = 谁在哪个 host、Agent 叫什么，
+# 属于人事信息，泄露了等于把内部人员结构和主机名一起交出去。
+#
+# 注意 gitignore 里**不带斜杠的模式在任意层级都匹配**，所以下面只写
+# 文件名即可，不需要 members.json / **/members.json 各来一行 —— 写了
+# 多余的那行更糟：它让人以为「靠这一行挡着」，真规则被删时毫无察觉。
+members.json
+webhook2nats.toml
+
 # 用 config/* 而非 config/：目录本身被排除时 git 无法重新包含其中的文件，
 # 只有示例模板（无任何环境值）可以豁免。
 config/*
 !config/webhook2nats.example.toml
+
+# ── 证书与凭据文件 ─────────────────────────────────────────────
+# 合成 CA 相关的中间产物也一并挡掉，免得哪天配了 https 就漏出去。
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# ── 运行产物 ───────────────────────────────────────────────────
 data/
 seen.json
+*.log
+*.pid
+
+# ── 本地 compose 覆盖 ───────────────────────────────────────────
+# docker-compose.override.yml 会被 compose **自动合并**，是大家改本地
+# 镜像 tag、挂载路径、临时塞环境变量的标准位置。忽略它。
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# ── 编辑器与工具产物 ───────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.rej
+
+# ── Python 构建产物 ─────────────────────────────────────────────
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 调试残留 ───────────────────────────────────────────────────
+nohup.out
+*.core
+core.*

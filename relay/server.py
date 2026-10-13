@@ -47,12 +47,18 @@ _STARTED_AT = time.time()
 def version_info():
     """版本信息。
 
-    Git SHA 由构建时注入（Dockerfile 的 ARG GIT_SHA → CI 传 --build-arg）。
-    本地跑时拿不到就是 unknown —— 不能为了填这个字段去依赖 .git 目录，
-    交付镜像里本来就没有。
+    两个字段刻意分开：
+      version —— 发布版本号（如 1.0.0），运维一眼看出「我跑的是哪一版」
+      commit  —— 精确到 commit，能追到具体代码
+
+    只在构建期注入（Dockerfile 的 ARG VERSION / ARG GIT_SHA → CI 传
+    --build-arg），**不在镜像里烤死** —— 烤死了每次发版都要改 Dockerfile，
+    而「版本号出现在多处、有的改了有的没改」正是最常见的发版事故。
+    本地 build 不传就是 unknown，那是诚实的：本地镜像本来就没有发布版本。
     """
     return {
         "version": os.environ.get("WEBHOOK2NATS_VERSION", "") or "unknown",
+        "commit": os.environ.get("WEBHOOK2NATS_COMMIT", "") or "unknown",
         "started_at": _STARTED_AT,
         "uptime_seconds": round(time.time() - _STARTED_AT, 1),
     }

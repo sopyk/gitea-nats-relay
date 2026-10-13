@@ -159,7 +159,8 @@
 - 多数错误额外带 `hint`，说明**该改哪里的配置**，不用翻代码。
 
 - `GET /healthz` → NATS 连通返回 `200`（`status` 为 `ok`），否则 `503`（`error` 为 `nats-down`）
-- `GET /version` → `200`，`status` 为 `ok`，另返回 git commit SHA 与启动至今的秒数
+- `GET /version` → `200`，`status` 为 `ok`，另返回 `version`（发布版本号）、
+  `commit`（精确 commit）、`started_at` 与 `uptime_seconds`
 - `POST /gitea-hook`（Gitea webhook 配置的回调地址，路径由 provider 的 `path` 决定）：
 
 | 状态 | `status` / `error` | 含义 | 平台的下一步 |
