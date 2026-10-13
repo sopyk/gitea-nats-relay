@@ -267,6 +267,26 @@ docker compose logs -f
 
 镜像本身不含任何环境值，同一个不可变镜像可以在任何环境跑。
 
+### 两个 registry
+
+同一个镜像在 CI 里构建一次、推两处：
+
+| Registry | 路径 | 何时推送 |
+|---|---|---|
+| GitHub Container Registry | `ghcr.io/sopyk/webhook2nats` | 每次构建（含分支构建） |
+| Docker Hub | `sopyk/webhook2nats` | **仅正式版 git tag 推送** |
+
+Docker Hub 只收正式版，三个理由：那边的第一个镜像应当是干净的 `1.0.0`
+而不是分支 tag；分支/RC 构建频率高，会在 Docker Hub 上堆一串没人要的 tag；
+少一个凭据暴露面（分支构建可能来自他人的 PR，压根不需要 DockerHub 凭据）。
+
+tag 集合两边必须一致，且「预发布不许移动 `latest`」在**两个** registry 上都
+生效 —— CI 里有断言在强制，违反则构建失败。本地是 arm64，无法验证 amd64
+是否漏推，所以 CI 会逐个 registry 读远端 manifest 确认双架构齐全。
+
+推不到 Docker Hub 时，先确认仓库 Settings → Secrets and variables →
+Actions 里有 `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 两条 secret。
+
 ### ⚠️ 单实例约束（硬约束，不是建议）
 
 **一个 Gitea webhook 回调只能指向一个 relay 实例。**

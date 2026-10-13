@@ -25,6 +25,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Docker Hub 的目标仓库。与 GHCR 同一个镜像，推两份。
+  DOCKERHUB_IMAGE: sopyk/webhook2nats
 
 jobs:
   build:
@@ -51,11 +53,87 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 决定这次推到哪些 registry。
+      #
+      # GHCR 总是推（分支构建也要，方便测试）。Docker Hub **只推稳定版
+      # git tag** —— 三个理由：
+      #   1. DockerHub 上第一个镜像要是干净的正式版，不是 `main` 之类的分支 tag
+      #   2. 分支/RC 构建频率高，DockerHub 上会堆一串没人要的 tag
+      #   3. 少一个凭据暴露面：分支构建（可能是别人的 PR）不需要 DockerHub 凭据
+      - name: Decide target registries
+        id: targets
+        env:
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+          DH_IMAGE: ${{ env.DOCKERHUB_IMAGE }}
+        run: |
+          set -euo pipefail
+          images="${REGISTRY}/${IMAGE_NAME}"
+          dh="false"
+
+          case "$EVENT/$REF" in
+            push/refs/tags/v*)
+              # 预发布 git tag（-rc / -beta / -alpha）也不推 DockerHub：
+              # 和「latest 只跟正式版走」是同一条策略。
+              case "$REF" in
+                *-rc*|*-beta*|*-alpha*)
+                  echo "预发布 git tag：只推 GHCR，不进 Docker Hub" ;;
+                *)
+                  dh="true"
+                  images="${images}"$'\n'"docker.io/${DH_IMAGE}"
+                  echo "稳定版 git tag：GHCR + Docker Hub" ;;
+              esac ;;
+            *)
+              echo "非稳定版 tag 推送：只推 GHCR，不进 Docker Hub" ;;
+          esac
+
+          {
+            echo "images<<EOF"
+            echo "$images"
+            echo "EOF"
+            echo "dockerhub=$dh"
+          } >> "$GITHUB_OUTPUT"
+          echo "目标 registry（$dh 含 Docker Hub）："
+          echo "$images" | sed 's/^/  /'
+
+      # Docker Hub 只在需要时登录。放在条件分支里而不是无条件登录：
+      # secrets 缺失时登录会失败，而分支构建压根不需要用到这个凭据。
+      #
+      # 先显式校验 secret 非空。不加这段的话，secret 名字对不上（比如填成了
+      # DOCKER_HUB_TOKEN）只会得到一个「unauthorized」的含糊报错，
+      # 对着 DockerHub 官网查半天也查不出是 GitHub 侧名字写错。
+      - name: Check Docker Hub secrets
+        if: steps.targets.outputs.dockerhub == 'true'
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$DH_USER" ] || missing+=("DOCKERHUB_USERNAME")
+          [ -n "$DH_TOKEN" ] || missing+=("DOCKERHUB_TOKEN")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::缺少 secret: ${missing[*]} —— 到仓库 Settings → "\
+          "Secrets and variables → Actions → New repository secret 添加它。"\
+          "Docker Hub 的 PAT 在 Account Settings → Security → New Access Token，"\
+          "权限只勾 Read & Write。"
+            exit 1
+          fi
+          echo "Docker Hub 凭据齐全（用户名 $DH_USER）"
+
+      - name: Log in to Docker Hub
+        if: steps.targets.outputs.dockerhub == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Derive tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.targets.outputs.images }}
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -99,69 +177,123 @@ jobs:
         env:
           REF: ${{ github.ref }}
           META_JSON: ${{ steps.meta.outputs.json }}
+          DH_WANTED: ${{ steps.targets.outputs.dockerhub }}
         run: |
           set -euo pipefail
           # json['tags'] 里是**完整镜像引用**（ghcr.io/...:latest），
           # 直接拿去和 'latest' 比永远不相等 —— 那会让断言每次都报
           # 「缺 latest」，把每一次正式发布都卡死。只取最后一段。
-          tags=$(echo "$META_JSON" | python3 -c "
-          import json,sys
-          print(' '.join(t.rsplit(':',1)[-1]
-                           for t in json.load(sys.stdin)['tags']))")
-          echo "本次产出的 tag: $tags"
+          #
+          # 推两个 registry 时，tags 列表里每个逻辑 tag 出现两次
+          # （ghcr.io/...:1.0.0 和 docker.io/...:1.0.0），所以这里按
+          # 「registry 路径 → tag 集合」分组判断，而不是拍平成一张大表。
+          python3 - <<'PY'
+          import json, os, sys
 
-          is_prerelease=false
-          case "$REF" in
-            refs/tags/*-rc*|refs/tags/*-beta*|refs/tags/*-alpha*)
-              is_prerelease=true ;;
-          esac
+          ref = os.environ["REF"]
+          meta = json.loads(os.environ["META_JSON"])
+          dh_wanted = os.environ["DH_WANTED"] == "true"
 
-          has_latest=false
-          for t in $tags; do
-            if [ "$t" = "latest" ]; then has_latest=true; fi
-          done
+          by_reg = {}
+          for full in meta["tags"]:
+              path, _, tag = full.rpartition(":")
+              by_reg.setdefault(path, set()).add(tag)
 
-          if [ "$is_prerelease" = true ] && [ "$has_latest" = true ]; then
-            echo "::error::预发布不允许移动 latest —— 那会让别人 docker compose pull 到未经测试的镜像。tag 规则被改了吗？"
-            exit 1
-          fi
+          print("按 registry 分组的 tag：")
+          for path in sorted(by_reg):
+              print(f"  {path}: {sorted(by_reg[path])}")
 
-          # 打了 git tag 的**稳定**版本必须带 latest，否则 compose 里的
-          # :latest 会指向旧版本或者根本不存在。
-          # 这两条互斥：预发布已经在上面判过了，别拿「正式版缺 latest」
-          # 去误伤一个正确的预发布构建。
-          case "$REF" in
-            refs/tags/*)
-              if [ "$is_prerelease" = false ] && [ "$has_latest" = false ]; then
-                echo "::error::正式版必须产出 latest，实际 tags: $tags"
-                exit 1
-              fi ;;
-          esac
+          is_prerelease = any(f"-{p}" in ref for p in ("rc", "beta", "alpha"))
 
-          echo "tag 策略校验通过（预发布=$is_prerelease latest=$has_latest）"
+          def fail(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
 
-      # QEMU 交叉构建偶尔会静默跳过某个架构（本地能验证的最好在这里也验证）
+          # 1) 预发布不许动 latest（任何 registry 都不行）。
+          #    **只在预发布时判** —— 稳定版本来就该带 latest，少了这个
+          #    门槛会把每一次正式版发布都判成失败。
+          if is_prerelease:
+              for path, tags in by_reg.items():
+                  if "latest" in tags:
+                      fail(f"{path} 带了 latest —— 预发布版本不允许移动 latest，"
+                           f"否则别人 pull 到的是未测试镜像")
+
+          # 2) 稳定版 git tag 的**每个**目标 registry 都必须带 latest
+          if ref.startswith("refs/tags/") and not is_prerelease:
+              for path, tags in by_reg.items():
+                  if not {"latest"} <= tags:
+                      fail(f"{path} 缺 latest（实际 {sorted(tags)}）")
+
+          # 3) 两个 registry 的 tag 集合必须一致。
+          #    不一致意味着有一侧漏推或多推 —— 最常见的成因是
+          #    metadata-action 的 images 列表拼错，只加了一个 registry。
+          if dh_wanted:
+              paths = sorted(by_reg)
+              if len(paths) < 2:
+                  fail(f"Docker Hub 被标记为目标，但 tags 里只有 {paths}，"
+                       f"images 列表拼错了？")
+              first = by_reg[paths[0]]
+              for path in paths[1:]:
+                  if by_reg[path] != first:
+                      fail(f"{path} 的 tag 集合与 {paths[0]} 不一致："
+                           f"{sorted(by_reg[path])} vs {sorted(first)}")
+
+          print("tag 策略校验通过"
+                f"（预发布={is_prerelease} DockerHub={dh_wanted}）")
+          PY
+
+      # QEMU 交叉构建偶尔会静默跳过某个架构（本地能验的就在 CI 里也验）。
+      # 用 buildx 自带的 imagetools 读远端 manifest —— 它已经处理了
+      # token、Accept 头、多架构 index 这些细节，手写 curl 容易出错
+      # （前两版就栽在 tags 是 list 不是 dict、以及多行 JSON 被 YAML 折行上）。
+      #
+      # **逐 registry 验，Docker Hub 也验**。那是「别人 pull 下来的镜像
+      # 能不能在自己机器上跑起来」的唯一证据 —— 本地是 arm64，验证不了
+      # amd64 有没有漏，只能靠这里读远端 manifest。
       - name: Verify both architectures landed
         env:
           TAGS_JSON: ${{ steps.meta.outputs.json }}
+          REGISTRY: ${{ env.REGISTRY }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
-          # 从 metadata-action 的 json 输出里取第一个 tag 的 digest
-          # metadata-action 的 json 输出里 tags 是 list[str]，不是 dict
-          image=$(echo "$TAGS_JSON" | python3 -c "
+          # metadata-action 的 json 输出里 tags 是 list[str]，不是 dict。
+          # 推两个 registry 时每条 tag 出现两次，这里先去重出 registry 路径。
+          repos=$(echo "$TAGS_JSON" | python3 -c "
           import json,sys
-          d=json.load(sys.stdin)
-          print(d['tags'][0])")
-          repo=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
-          token=$(curl -sSf \
-            "https://${REGISTRY}/token?scope=repository:${repo}:pull" \
-            | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
-          curl -sSf -H "Authorization: Bearer ${token}" \
-            -H 'Accept: application/vnd.oci.image.index.v1+json' \
-            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
-            "https://${REGISTRY}/v2/${repo}/manifests/${image}" > /tmp/m.json
-          python3 -c "
-          import json
+          seen=[]
+          for full in json.load(sys.stdin)['tags']:
+              path=full.rpartition(':')[0]
+              if path not in seen: seen.append(path)
+          print('\n'.join(seen))")
+          echo "要验证的 registry 仓库："; echo "$repos" | sed 's/^/  /'
+
+          while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              case "$path" in
+                  ghcr.io/*)   reg="ghcr.io";   name="${path#ghcr.io/}" ;;
+                  docker.io/*) reg="docker.io"; name="${path#docker.io/}" ;;
+                  *) echo "::warning::不认识的 registry $path，跳过"; continue ;;
+              esac
+
+              # 两个 registry 的匿名 token 端点格式不一样：
+              #   GHCR  → https://ghcr.io/token?scope=repository:owner/repo:pull
+              #   Docker → https://auth.docker.io/token?service=registry.docker.io&scope=...
+              if [ "$reg" = "ghcr.io" ]; then
+                  token_url="https://ghcr.io/token?scope=repository:${name}:pull&service=ghcr.io"
+              else
+                  token_url="https://auth.docker.io/token?service=registry.docker.io&scope=repository:${name}:pull"
+              fi
+              token=$(curl -sSf "$token_url" \
+                  | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+              echo "── $path"
+              curl -sSf -H "Authorization: Bearer ${token}" \
+                  -H 'Accept: application/vnd.oci.image.index.v1+json' \
+                  -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+                  "https://${reg}/v2/${name}/manifests/latest" > /tmp/m.json
+              python3 -c "
+          import json,sys
           d = json.load(open('/tmp/m.json'))
           plats = sorted({m['platform']['os']+'/'+m['platform']['architecture']
                           for m in d.get('manifests', []) if 'platform' in m})
@@ -170,3 +302,4 @@ jobs:
           if missing:
               sys.exit('缺少架构: %s —— QEMU 可能静默跳过了' % sorted(missing))
           print('✓ 双架构确认')"
+          done <<< "$repos"
