@@ -1,5 +1,7 @@
 # 更新日志
 
+[English](CHANGELOG.en.md) · 中文
+
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 本文件记录**面向使用者**的变更。仓库的**唯一版本真源**是根目录的
