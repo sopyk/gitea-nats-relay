@@ -652,6 +652,105 @@ def _find_box_diagram(text):
     return next((b for b in blocks if "─" in b and "│" in b), None)
 
 
+# Mermaid 里节点可以带形状：`id["标签"]`、`id[("标签")]`、`id(标签)`。
+# 正则里必须把形状吃进去，否则 `a1["平台"] -->|"…"| a2` 这种**带定义**的边
+# 一条都匹配不上 —— 第一版就漏了 2 条边，还以为「三段都解析到了」。
+_MMD_SHAPE = r'(?:\[[^\]]*\]|\(\([^)]*\)\)|\(\s*[^)]*\))?'
+_MMD_EDGE = re.compile(
+    rf"([A-Za-z]\w*)\s*{_MMD_SHAPE}\s*(?:(-\.->)|(-->)|(~~~))\s*"
+    rf"(?:\|[^|\n]*\|\s*)?([A-Za-z]\w*)\s*{_MMD_SHAPE}")
+_MMD_DECL = re.compile(r"(?:^|[\s\]|])([A-Za-z]\w*)\s*\[")
+
+# 每张图「看得见的箭头」应该有几条（不含 `~~~` 这种不可见的排版连线）
+_MMD_SOLID_EDGES = {
+    "README.md": 4,            # Agent→Gitea, 平台→relay, relay→NATS, NATS→Agent
+    "README.en.md": 4,
+    "docs/architecture.md": 4,  # 平台→relay, relay→NATS, NATS→Agent, Agent→平台(虚线)
+}
+# 每张图必须出现的关键组件
+_MMD_COMPONENTS = ("Webhook2NATS", "NATS", "Agent")
+
+
+def _find_mermaid(text):
+    m = re.search(r"```mermaid\n(.*?)```", text, re.S)
+    return m.group(1) if m else None
+
+
+def _doc_text(rel):
+    with open(os.path.join(ROOT, rel), encoding="utf-8") as f:
+        return f.read()
+
+
+class DiagramRenderingTest(unittest.TestCase):
+    """图必须由 Mermaid 渲染，并保留一份纯文本兜底。
+
+    为什么换掉框线图：ASCII 图靠「CJK 恰好是拉丁字符两倍宽」才能对齐，
+    但这取决于字体回退 —— 用户反馈过「经常错位、不好看」。Mermaid 由
+    渲染器算布局，不存在这个前提；而且**边就是箭头**，不会再出现上一轮
+    那种「箭头被后写的框内容整个盖掉、而图看着还挺整齐」的情况。
+
+    代价是 Mermaid 只在会渲染它的地方生效（GitHub 页面），终端和 Docker Hub
+    看到的是源码。所以每张图下面保留一份折叠的纯文本版 —— 纯文本版对齐
+    是**验证过的**（见 LocalizedDocsTest 里按显示宽度校验的那几条）。
+    """
+
+    def test_primary_diagrams_are_mermaid(self):
+        """主图必须是 Mermaid —— 错位的根源就是手画的框线。"""
+        for rel in _MMD_SOLID_EDGES:
+            src = _find_mermaid(_doc_text(rel))
+            self.assertIsNotNone(src, f"{rel} 里没有 ```mermaid 代码块")
+            self.assertRegex(
+                src, r"^\s*flowchart\s", f"{rel} 的 Mermaid 块没有声明图类型")
+
+    def test_mermaid_shows_every_component_and_hop(self):
+        """关键组件必须在，且**看得见的箭头数**要对得上。
+
+        边数断言是重点：上一轮框线图把箭头全盖掉而没人发现，就是因为
+        「有没有箭头」当时没有任何断言在看。Mermaid 里箭头是边，删一条
+        边这里立刻少一条。
+        """
+        for rel, want in _MMD_SOLID_EDGES.items():
+            src = _find_mermaid(_doc_text(rel))
+            self.assertIsNotNone(src, f"{rel} 里没有 Mermaid 块")
+            for comp in _MMD_COMPONENTS:
+                self.assertIn(comp, src, f"{rel} 的图里少了 {comp}")
+            edges = _MMD_EDGE.findall(src)
+            solid = [e for e in edges if e[1] or e[2]]
+            self.assertEqual(
+                len(solid), want,
+                f"{rel} 的图有 {len(solid)} 条可见箭头，应为 {want} 条"
+                f" —— 少的那一跳没画出来")
+
+    def test_mermaid_edges_reference_declared_nodes(self):
+        """边引用的节点必须声明过，否则 Mermaid 会自己造一个匿名节点。
+
+        这正是上一轮那个错的翻版：组件「看起来在」，实际接线没接上。
+        """
+        for rel in _MMD_SOLID_EDGES:
+            src = _find_mermaid(_doc_text(rel))
+            declared = set(_MMD_DECL.findall(src))
+            used = {x for e in _MMD_EDGE.findall(src) for x in (e[0], e[4])}
+            self.assertEqual(
+                used - declared, set(),
+                f"{rel} 的图里 {sorted(used - declared)} 出现在边上却没声明节点")
+
+    def test_plain_text_fallback_is_kept(self):
+        """Mermaid 下面必须留一份可读的纯文本图。
+
+        没有它，终端里 `cat README.md` 和 Docker Hub 页面上就只剩一堆
+        Mermaid 源码 —— 那两个地方都不渲染 Mermaid。
+        """
+        for rel in ("README.md", "README.en.md"):
+            text = _doc_text(rel)
+            self.assertIn("<details>", text, f"{rel} 没有折叠的纯文本兜底")
+            details = text[text.index("<details>"):text.index("</details>")]
+            self.assertIn("<summary>", details,
+                          f"{rel} 的折叠块没有 summary，点不开")
+            self.assertIsNotNone(
+                _find_box_diagram(details),
+                f"{rel} 的折叠块里没有纯文本框线图")
+
+
 class LocalizedDocsTest(unittest.TestCase):
     """中英两份文档必须事实一致、能互相找到、并且都保持可用。
 
