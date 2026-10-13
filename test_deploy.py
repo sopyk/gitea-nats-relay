@@ -13,10 +13,10 @@ import importlib.util
 import os
 import re
 import subprocess
-from pathlib import Path
 import sys
 import tomllib
 import unittest
+from pathlib import Path
 
 try:
     HAS_YAML = importlib.util.find_spec("yaml") is not None
@@ -26,6 +26,9 @@ except Exception:  # noqa
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOML_EXAMPLE = os.path.join(ROOT, "config", "webhook2nats.example.toml")
 ENV_EXAMPLE = os.path.join(ROOT, "relay.env.example")
+# 直接 import relay/config.py，而不是起子进程：快，且失败信息能直接指到用例。
+sys.path.insert(0, os.path.join(ROOT, "relay"))
+import config as config_mod  # noqa: E402
 # 一行真正的环境变量赋值，可带前导 '#'（模板里未启用的项就是注释掉的示例）。
 _ENV_ASSIGN = re.compile(r"^\s*#?\s*([A-Z][A-Z0-9_]*)\s*=")
 COMPOSE_RUN = os.path.join(ROOT, "docker-compose.yml")
@@ -346,6 +349,96 @@ class ExampleConfigTest(unittest.TestCase):
                              f"[events] 出现不存在的 header 值 {bogus!r}，会静默丢事件")
         for real in ("pull_request_approved", "pull_request_rejected", "pull_request_comment"):
             self.assertIn(real, p["events"], f"[events] 缺 {real}")
+
+
+class TemplateUsabilityTest(unittest.TestCase):
+    """模板必须**真的能用**，而不是「在库里就算数」。
+
+    背景是一次真实的误解要避免：为了不泄露部署环境里的用户名/IP，
+    把真实值全换成了占位符 —— 这件事本身是对的。但它有个反向风险：
+    **万一连模板本身也被误清理了，仓库就不再是一个能用的起点**。
+    「不含环境值」和「不可用」是两件事，这里盯的是后者。
+
+    「不含环境值」由 relay/test_internals.py::RoutingTest 的隐私守卫负责；
+    本类只保证模板齐全、且照 README 的步骤走能配出一个能加载的配置。
+    """
+
+    def setUp(self):
+        with open(TOML_EXAMPLE, "rb") as f:
+            self.toml = tomllib.load(f)
+
+    def test_both_templates_are_tracked(self):
+        """模板进不了库 = 别人下下来没法用。这是硬要求。"""
+        try:
+            r = subprocess.run(["git", "ls-files"], cwd=ROOT,
+                               capture_output=True, text=True, timeout=30)
+            tracked = set(r.stdout.split())
+        except (subprocess.SubprocessError, OSError):
+            self.skipTest("拿不到 git ls-files")
+        for name in ("config/webhook2nats.example.toml", "relay.env.example"):
+            self.assertIn(name, tracked,
+                          f"{name} 没进库 —— 别人克隆下来就没法部署")
+
+    def test_toml_template_contains_every_required_section(self):
+        for sec in ("nats", "providers", "routing", "dedup", "logging"):
+            self.assertIn(sec, self.toml, f"示例配置缺 [{sec}] 段")
+        # 必填项必须在模板里出现且是占位符，而不是被删掉「反正有默认值」
+        self.assertIn("servers", self.toml["nats"])
+        self.assertIn("user", self.toml["nats"])
+        self.assertIn("password", self.toml["nats"])
+        for provider in self.toml.get("providers", {}).values():
+            self.assertIn("signature", provider,
+                          "provider 缺 signature 段 —— 没有它无法验签")
+            self.assertIn("secret", provider["signature"])
+
+    def test_env_template_covers_the_required_vars(self):
+        """必填环境变量必须在 relay.env.example 里，且是**未注释**的。
+
+        未注释很关键：模板里以 `#` 开头的是「可选项示例」，用户会以为
+        不填也能跑。必填项被注释掉的话，照抄的人会漏填，启动时才报错。
+        """
+        with open(ENV_EXAMPLE, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        active = {}
+        for line in lines:
+            if line.startswith("#") or "=" not in line:
+                continue
+            active[line.split("=", 1)[0].strip()] = line.split("=", 1)[1]
+        for var in ("NATS_SERVERS", "NATS_USER", "NATS_PASSWORD",
+                    "WEBHOOK_SECRET"):
+            self.assertIn(
+                var, active,
+                f"{var} 是必填的，却没在 relay.env.example 里以生效状态出现 "
+                f"（注释掉的话用户会漏填）")
+
+    def test_a_fresh_clone_can_produce_a_loadable_config(self):
+        """照 README 的步骤拼一份配置出来，必须能通过配置加载与校验。
+
+        这是「下下去能用」的可执行版本：拼不出来就说明模板缺东西或文档
+        与模板对不上。允许纯环境变量模式（README 说了不配 TOML 也能跑），
+        所以这里补的是**最小必需项**，不是整份模板。
+        """
+        import tempfile
+        env = {"NATS_SERVERS": "nats://x:4222", "NATS_USER": "u",
+               "NATS_PASSWORD": "p", "WEBHOOK_SECRET": "s"}
+        tmp = tempfile.mkdtemp()
+        # 1) 不放任何 TOML —— README 承诺的「纯环境变量模式」必须能起
+        cfg = config_mod.load(path=os.path.join(tmp, "absent.toml"), env=env)
+        self.assertTrue(cfg.enabled_providers(),
+                        "纯环境变量模式下没有可用 provider")
+
+        # 2) 原样用示例 TOML + 环境变量 —— 模板本身必须自洽可用
+        cfg2 = config_mod.load(path=TOML_EXAMPLE, env=env)
+        self.assertTrue(cfg2.enabled_providers(),
+                        "示例 TOML 原样加载后没有可用 provider")
+
+    def test_readme_quickstart_matches_the_templates(self):
+        """README 的快速上手必须提到两个模板文件，否则用户不知道去哪儿。"""
+        with open(README, encoding="utf-8") as f:
+            readme = f.read()
+        for token in ("relay.env.example", "members.json"):
+            self.assertIn(token, readme,
+                          f"README 的快速上手没提到 {token}，新用户会不知道要准备它")
 
 
 class VersionConsistencyTest(unittest.TestCase):
